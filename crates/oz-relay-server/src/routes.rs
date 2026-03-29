@@ -93,7 +93,74 @@ async fn handle_bug_report(
         .into_response();
     }
 
-    // Generate ID
+    // Sanitize query for privacy (strip literal values)
+    let mut sanitized_report = report.clone();
+    if let Some(ref query) = sanitized_report.query {
+        sanitized_report.query = Some(bug_report::sanitize_query(query));
+    }
+
+    // Deduplication: check if this exact bug already exists
+    let fp = bug_report::fingerprint(&report);
+    let bugs_dir = state.config.data_dir.join("bugs/incoming");
+    let triaged_dir = state.config.data_dir.join("bugs/triaged");
+
+    // Scan incoming + triaged for matching fingerprint
+    let mut existing_path = None;
+    for dir in [&bugs_dir, &triaged_dir] {
+        if let Ok(entries) = tokio::fs::read_dir(dir).await {
+            let mut entries = entries;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                    if let Ok(stored) = serde_json::from_str::<StoredBugReport>(&content) {
+                        if stored.fingerprint == fp {
+                            existing_path = Some(entry.path());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if existing_path.is_some() {
+            break;
+        }
+    }
+
+    if let Some(path) = existing_path {
+        // Duplicate — increment occurrence count
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            if let Ok(mut stored) = serde_json::from_str::<StoredBugReport>(&content) {
+                stored.occurrences += 1;
+                stored.last_seen_at = Some(chrono::Utc::now());
+                let json = serde_json::to_string_pretty(&stored).unwrap();
+                let _ = tokio::fs::write(&path, &json).await;
+
+                tracing::info!(
+                    bug_id = %stored.id,
+                    occurrences = stored.occurrences,
+                    fingerprint = %fp,
+                    "duplicate bug report — incremented occurrence count"
+                );
+
+                state.task_manager.log_event(serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": "bug.duplicate",
+                    "bug_id": stored.id,
+                    "occurrences": stored.occurrences,
+                    "fingerprint": fp,
+                })).await;
+
+                return Json(serde_json::json!({
+                    "id": stored.id,
+                    "status": "duplicate",
+                    "occurrences": stored.occurrences,
+                    "message": "This bug has already been reported. Occurrence count incremented."
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    // New bug — generate ID and store
     let bug_id = format!(
         "{}-{}",
         chrono::Utc::now().format("%Y%m%d-%H%M%S"),
@@ -102,14 +169,14 @@ async fn handle_bug_report(
 
     let stored = StoredBugReport {
         id: bug_id.clone(),
-        report: report.clone(),
+        report: sanitized_report,
         received_at: chrono::Utc::now(),
-        source_hash: format!("{:x}", fnv_hash(report.error_message.as_bytes())),
+        last_seen_at: None,
+        fingerprint: fp.clone(),
+        occurrences: 1,
         status: "incoming".into(),
     };
 
-    // Write to bugs/incoming/
-    let bugs_dir = state.config.data_dir.join("bugs/incoming");
     let bug_file = bugs_dir.join(format!("{}.json", bug_id));
     let json = serde_json::to_string_pretty(&stored).unwrap();
 
@@ -118,11 +185,11 @@ async fn handle_bug_report(
         return Json(serde_json::json!({"error": "internal error"})).into_response();
     }
 
-    // Append to ledger
     state.task_manager.log_event(serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "event": "bug.reported",
         "bug_id": bug_id,
+        "fingerprint": fp,
         "category": report.category,
         "arcflow_version": report.arcflow_version,
         "has_trace": report.stack_trace.is_some(),
@@ -131,9 +198,10 @@ async fn handle_bug_report(
 
     tracing::info!(
         bug_id = %bug_id,
+        fingerprint = %fp,
         category = %report.category,
         version = %report.arcflow_version,
-        "bug report received"
+        "new bug report received"
     );
 
     Json(serde_json::json!({
@@ -249,15 +317,6 @@ async fn handle_bug_triage(
     .into_response()
 }
 
-/// FNV-1a hash for deduplication (not cryptographic).
-fn fnv_hash(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in data {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
 
 /// POST /promotions/list — list pending promotions
 async fn handle_promotions_list(

@@ -47,14 +47,80 @@ fn default_category() -> String {
 pub struct StoredBugReport {
     /// Server-assigned ID.
     pub id: String,
-    /// The original report.
+    /// The original report (query sanitized for privacy).
     pub report: BugReport,
-    /// When the report was received.
+    /// When the report was first received.
     pub received_at: DateTime<Utc>,
-    /// Source IP (hashed for privacy).
-    pub source_hash: String,
+    /// When the most recent duplicate was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    /// Deduplication fingerprint: hash of (error_message + version + query_structure).
+    pub fingerprint: String,
+    /// Number of times this exact bug has been reported.
+    pub occurrences: u32,
     /// Current status.
     pub status: String,
+}
+
+/// Generate a deduplication fingerprint from a bug report.
+/// Hashes error_message + arcflow_version + query structure (without literal values).
+pub fn fingerprint(report: &BugReport) -> String {
+    let query_structure = report
+        .query
+        .as_deref()
+        .map(strip_query_literals)
+        .unwrap_or_default();
+    let input = format!(
+        "{}|{}|{}",
+        report.error_message.trim().to_lowercase(),
+        report.arcflow_version,
+        query_structure
+    );
+    format!("{:016x}", fnv_hash(input.as_bytes()))
+}
+
+/// Strip literal values from a query for privacy and deduplication.
+/// "CREATE (n:Person {name: 'Alice', ssn: '123-45-6789'})" →
+/// "CREATE (n:Person {name: ?, ssn: ?})"
+pub fn sanitize_query(query: &str) -> String {
+    let mut result = String::with_capacity(query.len());
+    let mut in_string = false;
+    let mut quote_char = ' ';
+
+    let mut chars = query.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            if c == quote_char && chars.peek() != Some(&quote_char) {
+                result.push('?');
+                result.push(c);
+                in_string = false;
+            }
+            // Skip string contents
+        } else if c == '\'' || c == '"' {
+            quote_char = c;
+            in_string = true;
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Strip literals for fingerprinting (more aggressive than sanitize_query).
+fn strip_query_literals(query: &str) -> String {
+    let sanitized = sanitize_query(query);
+    // Also normalize whitespace
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn fnv_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in data {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Maximum lengths for bug report fields (prevent abuse).
@@ -220,6 +286,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sanitize_strips_literals() {
+        let q = "CREATE (n:Person {name: 'Alice', ssn: '123-45-6789'}) RETURN n";
+        let s = sanitize_query(q);
+        assert!(!s.contains("Alice"));
+        assert!(!s.contains("123-45-6789"));
+        assert!(s.contains("name: '?'"));
+        assert!(s.contains("ssn: '?'"));
+        assert!(s.contains("CREATE"));
+        assert!(s.contains("RETURN"));
+    }
+
+    #[test]
+    fn sanitize_preserves_structure() {
+        let q = "MATCH (a)-[:KNOWS]->(b) WHERE a.age > 30 RETURN b.name";
+        let s = sanitize_query(q);
+        assert_eq!(s, q); // no string literals to strip
+    }
+
+    #[test]
+    fn fingerprint_deduplicates() {
+        let r1 = BugReport {
+            error_message: "QueryError: += not supported".into(),
+            arcflow_version: "1.7.0".into(),
+            category: "runtime-error".into(),
+            stack_trace: None,
+            query: Some("SET n.count += 1".into()),
+            trace_id: None,
+            target_triple: None,
+            context: None,
+        };
+        let r2 = r1.clone(); // identical
+        assert_eq!(fingerprint(&r1), fingerprint(&r2));
+
+        // Different error → different fingerprint
+        let mut r3 = r1.clone();
+        r3.error_message = "QueryError: -= not supported".into();
+        assert_ne!(fingerprint(&r1), fingerprint(&r3));
+    }
+
+    #[test]
+    fn fingerprint_ignores_literal_values() {
+        let r1 = BugReport {
+            error_message: "QueryError: invalid type".into(),
+            arcflow_version: "1.7.0".into(),
+            category: "runtime-error".into(),
+            stack_trace: None,
+            query: Some("CREATE (n {name: 'Alice'})".into()),
+            trace_id: None,
+            target_triple: None,
+            context: None,
+        };
+        let mut r2 = r1.clone();
+        r2.query = Some("CREATE (n {name: 'Bob'})".into());
+        // Same structure, different literals → same fingerprint
+        assert_eq!(fingerprint(&r1), fingerprint(&r2));
+    }
+
+    #[test]
     fn valid_report_passes() {
         let report = BugReport {
             error_message: "QueryError: OPTIONAL not supported".into(),
@@ -266,11 +390,14 @@ mod tests {
     }
 
     fn make_stored(report: BugReport) -> StoredBugReport {
+        let fp = fingerprint(&report);
         StoredBugReport {
             id: "20260329-test01".into(),
             report,
             received_at: chrono::Utc::now(),
-            source_hash: "deadbeef".into(),
+            last_seen_at: None,
+            fingerprint: fp,
+            occurrences: 1,
             status: "incoming".into(),
         }
     }
