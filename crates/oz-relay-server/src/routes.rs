@@ -99,6 +99,20 @@ async fn handle_message_send(
     claims: RelayClaims,
     req: JsonRpcRequest,
 ) -> Response {
+    // Entitlement check — reject before burning server-side tokens
+    if !claims.is_active() {
+        return Json(JsonRpcResponse::error(
+            req.id,
+            ERR_KEY_NOT_ACTIVE,
+            format!(
+                "key status is '{}' — only active keys can submit intents. \
+                 apply for a Developer Relay Account at https://oz.global/relay/keys",
+                claims.status
+            ),
+        ))
+        .into_response();
+    }
+
     // Rate limit check
     if let Err(retry_after) = state.rate_limiter.check(&claims.sub, &claims.tier) {
         return Json(JsonRpcResponse::error(
@@ -739,5 +753,132 @@ mod tests {
             .unwrap();
         let rpc: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(rpc.error.unwrap().code, ERR_RATE_LIMITED);
+    }
+
+    // Entitlement gate tests
+
+    #[tokio::test]
+    async fn pending_key_cannot_submit() {
+        let state = test_state();
+        let app = build_router(state);
+        let secret = &ServerConfig::test().jwt_secret;
+
+        let intent = oz_relay_common::intent::Intent {
+            description: "Add something".into(),
+            motivation: "Need it".into(),
+            category: oz_relay_common::intent::IntentCategory::Feature,
+            test_cases: vec![oz_relay_common::intent::TestCase {
+                query: "MATCH (n) RETURN n".into(),
+                expected_behavior: "returns nodes".into(),
+                input_data: None,
+            }],
+            context: oz_relay_common::intent::IntentContext {
+                arcflow_version: "1.7.0".into(),
+                ..Default::default()
+            },
+        };
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": intent.into_message(),
+        });
+
+        // Pending key should be rejected
+        let pending_token = RelayClaims::sign_with_status("dev_pending", "community", "pending", secret);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer bsk_{}", pending_token))
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK); // JSON-RPC returns 200 with error payload
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc.error.unwrap().code, ERR_KEY_NOT_ACTIVE);
+    }
+
+    #[tokio::test]
+    async fn pending_key_can_read_tasks() {
+        let state = test_state();
+        let secret = &ServerConfig::test().jwt_secret;
+
+        // Create a task as the pending developer (via internal API)
+        let msg = Message {
+            role: MessageRole::User,
+            parts: vec![Part::Text { text: "test".into() }],
+        };
+        let task = state.task_manager.create_task("dev_pending", msg);
+
+        let app = build_router(state.clone());
+        let pending_token = RelayClaims::sign_with_status("dev_pending", "community", "pending", secret);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tasks/get",
+            "params": {"taskId": task.id.to_string()}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer bsk_{}", pending_token))
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rpc.error.is_none(), "pending key should be able to read tasks");
+    }
+
+    #[tokio::test]
+    async fn suspended_key_rejected_at_auth() {
+        let state = test_state();
+        let app = build_router(state);
+        let secret = &ServerConfig::test().jwt_secret;
+
+        let suspended_token = RelayClaims::sign_with_status("dev_bad", "community", "suspended", secret);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tasks/get",
+            "params": {"taskId": "00000000-0000-0000-0000-000000000000"}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer bsk_{}", suspended_token))
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Suspended keys get 403 at the middleware level
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
