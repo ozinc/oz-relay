@@ -8,6 +8,7 @@
 //! - #5: Tenant isolation — task access filtered by JWT `sub` claim
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::middleware;
@@ -18,6 +19,10 @@ use axum::Router;
 use oz_relay_common::a2a::*;
 use oz_relay_common::intent::Intent;
 use oz_relay_common::validation::validate_intent;
+
+use crate::agent_bridge;
+use crate::response_filter;
+use crate::sandbox;
 
 use crate::auth::{auth_middleware, RelayClaims};
 use crate::AppState;
@@ -136,22 +141,131 @@ async fn handle_message_send(
         }
     };
 
-    // Validate the intent if present
-    if let Some(intent) = Intent::from_message(&message) {
-        let errors = validate_intent(&intent);
-        if !errors.is_empty() {
-            let error_msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+    // Validate the intent and extract it
+    let intent = match Intent::from_message(&message) {
+        Some(intent) => {
+            let errors = validate_intent(&intent);
+            if !errors.is_empty() {
+                let error_msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                return Json(JsonRpcResponse::error(
+                    req.id,
+                    ERR_INVALID_INTENT,
+                    format!("intent validation failed: {}", error_msgs.join("; ")),
+                ))
+                .into_response();
+            }
+            intent
+        }
+        None => {
             return Json(JsonRpcResponse::error(
                 req.id,
                 ERR_INVALID_INTENT,
-                format!("intent validation failed: {}", error_msgs.join("; ")),
+                "message must contain an intent (application/vnd.oip.intent+json)",
             ))
             .into_response();
         }
-    }
+    };
 
-    // FIX #5: Create the task with owner from JWT claims
+    // Create the task with owner from JWT claims
     let task = state.task_manager.create_task(&claims.sub, message);
+    let task_id = task.id;
+
+    // Spawn the build session in the background if source repo is configured
+    if let Some(ref source_repo) = state.config.source_repo {
+        let source_repo = source_repo.clone();
+        let timeout = Duration::from_secs(state.config.sandbox_timeout_secs);
+        let task_manager = state.clone();
+
+        tokio::spawn(async move {
+            // Transition to Working
+            let _ = task_manager.task_manager.transition_task(task_id, TaskState::Working);
+
+            // Create worktree
+            let session_id = task_id.to_string();
+            let worktree = match sandbox::create_worktree(&source_repo, &session_id).await {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = task_manager.task_manager.add_message(
+                        task_id,
+                        Message {
+                            role: MessageRole::Agent,
+                            parts: vec![Part::Text {
+                                text: format!("Build setup failed: {}", response_filter::filter_response(&e)),
+                            }],
+                        },
+                    );
+                    let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                    return;
+                }
+            };
+
+            // Prepare worktree with CLAUDE.md and prompt
+            if let Err(e) = agent_bridge::prepare_worktree(&worktree, &intent).await {
+                let _ = task_manager.task_manager.add_message(
+                    task_id,
+                    Message {
+                        role: MessageRole::Agent,
+                        parts: vec![Part::Text {
+                            text: format!("Build setup failed: {}", response_filter::filter_response(&e)),
+                        }],
+                    },
+                );
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
+                return;
+            }
+
+            // Run Claude Code headless in the worktree
+            let prompt_path = worktree.join(".relay-prompt.md");
+            let agent_result = sandbox::run_sandboxed(
+                "claude",
+                &[
+                    "--print",
+                    "--dangerously-skip-permissions",
+                    &format!("Read the file {} and implement the change request described in it. Follow all rules in CLAUDE.md strictly.", prompt_path.display()),
+                ],
+                &worktree,
+                timeout,
+            )
+            .await;
+
+            // Run cargo test
+            let test_result = agent_bridge::run_cargo_test(&worktree, timeout).await;
+            let (passed, failed) = agent_bridge::parse_test_results(&test_result.stdout);
+
+            // Build the filtered summary
+            let raw_summary = if agent_result.timed_out {
+                "Build timed out.".to_string()
+            } else {
+                agent_result.stdout.clone()
+            };
+            let filtered = response_filter::filter_response(&raw_summary);
+
+            let summary = format!(
+                "{}\n\nTests: {} passed, {} failed.",
+                filtered, passed, failed
+            );
+
+            // Add agent response message
+            let _ = task_manager.task_manager.add_message(
+                task_id,
+                Message {
+                    role: MessageRole::Agent,
+                    parts: vec![Part::Text { text: summary }],
+                },
+            );
+
+            // Transition based on test results
+            if test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out {
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Completed);
+            } else {
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+            }
+
+            // Cleanup worktree
+            let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
+        });
+    }
 
     Json(JsonRpcResponse::success(
         req.id,

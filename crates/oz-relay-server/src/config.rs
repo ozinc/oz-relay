@@ -4,6 +4,7 @@
 //! Server configuration.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -12,6 +13,8 @@ pub struct ServerConfig {
     pub jwt_secret: String,
     pub rate_limits: RateLimitConfig,
     pub nsjail_config: Option<String>,
+    pub source_repo: Option<PathBuf>,
+    pub sandbox_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +44,11 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "dev-secret-change-in-production".into()),
             rate_limits: RateLimitConfig::default(),
             nsjail_config: std::env::var("RELAY_NSJAIL_CONFIG").ok(),
+            source_repo: std::env::var("RELAY_SOURCE_REPO").ok().map(PathBuf::from),
+            sandbox_timeout_secs: std::env::var("RELAY_SANDBOX_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1800),
         }
     }
 
@@ -52,6 +60,8 @@ impl ServerConfig {
             jwt_secret: "test-secret-key-for-unit-tests".into(),
             rate_limits: RateLimitConfig::default(),
             nsjail_config: None,
+            source_repo: None,
+            sandbox_timeout_secs: 1800,
         }
     }
 }
