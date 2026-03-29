@@ -18,6 +18,7 @@ use axum::Router;
 
 use oz_relay_common::a2a::*;
 use oz_relay_common::intent::Intent;
+use oz_relay_common::report;
 use oz_relay_common::validation::validate_intent;
 
 use crate::agent_bridge;
@@ -169,6 +170,21 @@ async fn handle_message_send(
         }
     };
 
+    // Build clarity report — immediate feedback to developer
+    let task_id_str = uuid::Uuid::new_v4().to_string();
+    let branch = report::branch_name(&claims.sub, &intent.description, &task_id_str);
+    let test_criteria: Vec<(String, String)> = intent
+        .test_cases
+        .iter()
+        .map(|tc| (tc.query.clone(), tc.expected_behavior.clone()))
+        .collect();
+    let clarity = report::clarity_report(
+        &claims.sub,
+        &intent.description,
+        &task_id_str,
+        &test_criteria,
+    );
+
     // Create the task with owner from JWT claims
     let task = state.task_manager.create_task(&claims.sub, message);
     let task_id = task.id;
@@ -176,6 +192,7 @@ async fn handle_message_send(
     tracing::info!(
         task_id = %task_id,
         owner = %claims.sub,
+        branch = %branch,
         category = %intent.category,
         description = %intent.description,
         "task created"
@@ -186,13 +203,16 @@ async fn handle_message_send(
         let source_repo = source_repo.clone();
         let timeout = Duration::from_secs(state.config.sandbox_timeout_secs);
         let task_manager = state.clone();
+        let branch_name = branch.clone();
+        let intent_desc = intent.description.clone();
+        let developer = claims.sub.clone();
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
 
             // Transition to Working
             let _ = task_manager.task_manager.transition_task(task_id, TaskState::Working);
-            tracing::info!(task_id = %task_id, "build started");
+            tracing::info!(task_id = %task_id, branch = %branch_name, "build started");
 
             // Create worktree
             let session_id = task_id.to_string();
@@ -298,31 +318,72 @@ async fn handle_message_send(
             };
             let filtered = response_filter::filter_response(&raw_summary);
 
-            let summary = format!(
-                "{}\n\nTests: {} passed, {} failed.",
-                filtered, passed, failed
-            );
+            let success = test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out;
 
-            // Add agent response message
+            // Build the structured report
+            let build_report = report::BuildReport {
+                branch: branch_name.clone(),
+                success,
+                summary: filtered,
+                tests: report::TestReport {
+                    total: passed + failed,
+                    passed,
+                    failed,
+                },
+                artifact: None, // TODO: compile and sign artifact
+            };
+
+            // Add build report as agent response
             let _ = task_manager.task_manager.add_message(
                 task_id,
                 Message {
                     role: MessageRole::Agent,
-                    parts: vec![Part::Text { text: summary }],
+                    parts: vec![Part::Data {
+                        mime_type: "application/vnd.oip.build-report+json".into(),
+                        data: serde_json::to_value(&build_report).unwrap(),
+                    }],
                 },
             );
 
             // Transition based on test results
-            let final_state = if test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out {
+            let final_state = if success {
                 let _ = task_manager.task_manager.transition_task(task_id, TaskState::Completed);
+
+                // Keep the branch for promotion — write metadata to promotions queue
+                let metadata = serde_json::json!({
+                    "task_id": task_id.to_string(),
+                    "branch": branch_name,
+                    "developer": developer,
+                    "description": intent_desc,
+                    "tests_passed": passed,
+                    "tests_failed": failed,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                let promotions_path = std::path::Path::new("/opt/promotions/pending");
+                if let Err(e) = tokio::fs::create_dir_all(promotions_path).await {
+                    tracing::warn!(error = %e, "could not create promotions directory");
+                }
+                let meta_file = promotions_path.join(format!("{}.json", task_id));
+                if let Err(e) = tokio::fs::write(&meta_file, metadata.to_string()).await {
+                    tracing::warn!(error = %e, "could not write promotion metadata");
+                } else {
+                    tracing::info!(task_id = %task_id, branch = %branch_name, "branch preserved for promotion review");
+                }
+
                 "completed"
             } else {
                 let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                // Failed builds: clean up the worktree
+                let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
                 "failed"
             };
 
-            // Cleanup worktree
-            let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
+            // Only clean up worktree on failure — successful builds keep the branch
+            if success {
+                // Remove the worktree directory but keep the branch ref
+                // The branch persists in the bare repo for promotion review
+                let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
+            }
 
             let total_elapsed = start.elapsed();
             tracing::info!(
@@ -338,9 +399,13 @@ async fn handle_message_send(
         tracing::warn!(task_id = %task_id, "no source_repo configured — task stays in submitted state");
     }
 
+    // Return task + clarity report
     Json(JsonRpcResponse::success(
         req.id,
-        serde_json::to_value(&task).unwrap(),
+        serde_json::json!({
+            "task": task,
+            "clarity": clarity,
+        }),
     ))
     .into_response()
 }
@@ -626,10 +691,17 @@ mod tests {
             .unwrap();
         let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
         assert!(rpc.error.is_none());
-        let task: Task = serde_json::from_value(rpc.result.unwrap()).unwrap();
+        let result = rpc.result.unwrap();
+        // Response now includes both task and clarity report
+        let task: Task = serde_json::from_value(result["task"].clone()).unwrap();
         assert_eq!(task.state, TaskState::Submitted);
         assert_eq!(task.owner, "dev_test");
         assert_eq!(task.messages.len(), 1);
+        // Verify clarity report is present
+        let clarity = &result["clarity"];
+        assert!(clarity["branch"].as_str().unwrap().starts_with("relay/dev_test-"));
+        assert!(!clarity["understoodAs"].as_str().unwrap().is_empty());
+        assert_eq!(clarity["testCriteria"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

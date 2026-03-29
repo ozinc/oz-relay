@@ -12,6 +12,7 @@
 
 pub mod a2a;
 pub mod intent;
+pub mod report;
 pub mod validation;
 
 pub use a2a::*;
