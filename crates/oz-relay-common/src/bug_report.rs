@@ -7,6 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::intent::{Intent, IntentCategory, IntentContext, TestCase};
+
 /// A structured bug report from an end user or OTEL exporter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

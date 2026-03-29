@@ -2,11 +2,13 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! Per-developer rate limiting by tier.
+//! Counters are reconstructed from the ledger on startup (RLY-0020).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::config::RateLimitConfig;
 
@@ -21,6 +23,62 @@ impl RateLimiter {
         Self {
             config,
             counters: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reconstruct rate limit counters from the ledger.
+    /// Counts `task.created` events per owner in the last 24 hours.
+    pub fn load_from_ledger(&self, ledger_path: &Path) {
+        let content = match std::fs::read_to_string(ledger_path) {
+            Ok(c) => c,
+            Err(_) => return, // No ledger yet
+        };
+
+        let now = Utc::now();
+        let window = Duration::hours(24);
+        let cutoff = now - window;
+
+        let mut counts: HashMap<String, u32> = HashMap::new();
+
+        for line in content.lines() {
+            let event: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Only count task.created events
+            if event.get("event").and_then(|v| v.as_str()) != Some("task.created") {
+                continue;
+            }
+
+            // Parse timestamp
+            let ts = match event.get("ts").and_then(|v| v.as_str()) {
+                Some(ts) => match ts.parse::<DateTime<Utc>>() {
+                    Ok(dt) => dt,
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+
+            // Only count events in the current 24h window
+            if ts < cutoff {
+                continue;
+            }
+
+            if let Some(owner) = event.get("owner").and_then(|v| v.as_str()) {
+                *counts.entry(owner.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        if !counts.is_empty() {
+            let mut counters = self.counters.lock().unwrap();
+            for (owner, count) in &counts {
+                counters.insert(owner.clone(), (*count, now));
+            }
+            tracing::info!(
+                developers = counts.len(),
+                "rate limits restored from ledger"
+            );
         }
     }
 
@@ -40,7 +98,7 @@ impl RateLimiter {
             .or_insert((0, now));
 
         // Reset window if 24h has passed
-        let window_duration = chrono::Duration::hours(24);
+        let window_duration = Duration::hours(24);
         if now - entry.1 > window_duration {
             *entry = (0, now);
         }
@@ -96,5 +154,36 @@ mod tests {
         assert_eq!(limiter.check("dev_x", "community").unwrap(), 2);
         assert_eq!(limiter.check("dev_x", "community").unwrap(), 1);
         assert_eq!(limiter.check("dev_x", "community").unwrap(), 0);
+    }
+
+    #[test]
+    fn load_from_ledger_restores_counts() {
+        let dir = std::env::temp_dir().join(format!("rly-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("events.jsonl");
+
+        // Write some fake ledger entries
+        let now = Utc::now().to_rfc3339();
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"ts": now, "event": "task.created", "owner": "dev_alice"}),
+            serde_json::json!({"ts": now, "event": "task.created", "owner": "dev_alice"}),
+            serde_json::json!({"ts": now, "event": "task.created", "owner": "dev_bob"}),
+        );
+        std::fs::write(&ledger, content).unwrap();
+
+        let limiter = RateLimiter::new(RateLimitConfig {
+            community_per_day: 3,
+            professional_per_day: 10,
+            enterprise_per_day: 1000,
+        });
+        limiter.load_from_ledger(&ledger);
+
+        // Alice used 2, should have 1 remaining
+        assert_eq!(limiter.check("dev_alice", "community").unwrap(), 0);
+        // Bob used 1, should have 2 remaining
+        assert_eq!(limiter.check("dev_bob", "community").unwrap(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

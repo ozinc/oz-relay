@@ -53,9 +53,14 @@ async fn main() {
 
     let task_manager = TaskManager::init(&config.data_dir).await;
 
+    let rate_limiter = RateLimiter::new(config.rate_limits.clone());
+    // Restore rate limit counters from ledger (RLY-0020)
+    let ledger_path = config.data_dir.join("ledger/events.jsonl");
+    rate_limiter.load_from_ledger(&ledger_path);
+
     let state = Arc::new(AppState {
         task_manager,
-        rate_limiter: RateLimiter::new(config.rate_limits.clone()),
+        rate_limiter,
         config,
     });
 
