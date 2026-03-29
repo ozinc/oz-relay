@@ -11,6 +11,7 @@
 //! - Artifact: output binary with signed manifest
 
 pub mod a2a;
+pub mod clarity;
 pub mod intent;
 pub mod report;
 pub mod validation;

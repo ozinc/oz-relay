@@ -318,3 +318,4 @@ pub const ERR_INVALID_INTENT: i32 = -32003;
 pub const ERR_RATE_LIMITED: i32 = -32004;
 pub const ERR_UNAUTHORIZED: i32 = -32005;
 pub const ERR_KEY_NOT_ACTIVE: i32 = -32006;
+pub const ERR_INTENT_UNCLEAR: i32 = -32007;

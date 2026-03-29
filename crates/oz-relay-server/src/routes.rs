@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use oz_relay_common::a2a::*;
+use oz_relay_common::clarity;
 use oz_relay_common::intent::Intent;
 use oz_relay_common::report;
 use oz_relay_common::validation::validate_intent;
@@ -169,6 +170,37 @@ async fn handle_message_send(
             .into_response();
         }
     };
+
+    // Clarity gate — reject vague intents before burning tokens
+    let clarity_score = clarity::evaluate_clarity(&intent);
+    if !clarity_score.passes {
+        tracing::info!(
+            owner = %claims.sub,
+            score = clarity_score.score,
+            "intent rejected by clarity gate"
+        );
+        return Json(JsonRpcResponse::error(
+            req.id,
+            ERR_INTENT_UNCLEAR,
+            serde_json::json!({
+                "message": format!(
+                    "Intent scored {}/10 (minimum {}). Please make it more specific before submitting.",
+                    clarity_score.score, clarity::MIN_CLARITY_SCORE
+                ),
+                "score": clarity_score.score,
+                "feedback": clarity_score.feedback,
+                "signals": clarity_score.signals,
+            })
+            .to_string(),
+        ))
+        .into_response();
+    }
+
+    tracing::info!(
+        owner = %claims.sub,
+        clarity_score = clarity_score.score,
+        "intent passed clarity gate"
+    );
 
     // Build clarity report — immediate feedback to developer
     let task_id_str = uuid::Uuid::new_v4().to_string();
