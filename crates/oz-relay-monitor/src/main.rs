@@ -2,54 +2,78 @@
 // Licensed under the Apache License, Version 2.0.
 
 //! oz-relay-monitor — TUI dashboard for the OZ Relay pipeline.
-//! Reads filesystem state directly. No server API dependency.
 //!
-//! Usage: oz-relay-monitor [--data-dir /opt/oz-relay]
+//! Views:
+//!   Dashboard (d) — overview of pipeline, metrics, events
+//!   Ledger    (l) — full scrollable event log
+//!   Failed    (f) — details of failed tasks
+//!   Submitted (s) — submitted intents and their descriptions
+//!   Working   (w) — active builds in progress
+//!   Completed (c) — completed builds with reports
+//!   Bugs      (b) — incoming bug reports
+//!
+//! Press the key to switch views. Esc/Backspace returns to dashboard.
+//! Arrow keys scroll in detail views. q quits.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+#[derive(Clone, PartialEq)]
+enum View {
+    Dashboard,
+    Ledger,
+    TaskList(String), // directory name: "failed", "submitted", "working", "completed"
+    Bugs,
+}
+
+struct App {
+    view: View,
+    scroll: u16,
+    data_dir: PathBuf,
+}
+
 fn main() -> io::Result<()> {
     let data_dir = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with('-'))
-        .or_else(|| {
-            std::env::args()
-                .position(|a| a == "--data-dir")
-                .and_then(|i| std::env::args().nth(i + 1))
-        })
+        .position(|a| a == "--data-dir")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::args().nth(1).filter(|a| !a.starts_with('-')))
         .unwrap_or_else(|| "/opt/oz-relay".into());
 
-    let data_dir = PathBuf::from(data_dir);
-
-    // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let result = run_app(&mut terminal, &data_dir);
+    let mut app = App {
+        view: View::Dashboard,
+        scroll: 0,
+        data_dir: PathBuf::from(data_dir),
+    };
 
-    // Restore terminal
+    let result = run_app(&mut terminal, &mut app);
+
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
-
     result
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, data_dir: &Path) -> io::Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
     let tick_rate = Duration::from_secs(2);
     let mut last_tick = Instant::now();
 
     loop {
-        let state = scan_state(data_dir);
-        terminal.draw(|f| ui(f, &state, data_dir))?;
+        terminal.draw(|f| draw(f, app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -58,6 +82,50 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, data_dir: &Pat
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(())
+                    }
+                    KeyCode::Char('d') => {
+                        app.view = View::Dashboard;
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('l') => {
+                        app.view = View::Ledger;
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('f') => {
+                        app.view = View::TaskList("failed".into());
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('s') => {
+                        app.view = View::TaskList("submitted".into());
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('w') => {
+                        app.view = View::TaskList("working".into());
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('c') => {
+                        app.view = View::TaskList("completed".into());
+                        app.scroll = 0;
+                    }
+                    KeyCode::Char('b') => {
+                        app.view = View::Bugs;
+                        app.scroll = 0;
+                    }
+                    KeyCode::Esc | KeyCode::Backspace => {
+                        app.view = View::Dashboard;
+                        app.scroll = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.scroll = app.scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.scroll = app.scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        app.scroll = app.scroll.saturating_add(20);
+                    }
+                    KeyCode::PageUp => {
+                        app.scroll = app.scroll.saturating_sub(20);
                     }
                     _ => {}
                 }
@@ -69,188 +137,234 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, data_dir: &Pat
     }
 }
 
-/// All state derived from the filesystem.
+fn draw(f: &mut Frame, app: &App) {
+    match &app.view {
+        View::Dashboard => draw_dashboard(f, app),
+        View::Ledger => draw_ledger(f, app),
+        View::TaskList(dir) => draw_task_list(f, app, dir),
+        View::Bugs => draw_bugs(f, app),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard view
+// ---------------------------------------------------------------------------
+
 struct DashboardState {
     submitted: usize,
-    working: Vec<WorkingTask>,
+    working: Vec<TaskSummary>,
     completed: usize,
     failed: usize,
     canceled: usize,
-
     promo_pending: usize,
     promo_approved: usize,
     promo_merged: usize,
     promo_rejected: usize,
-
     bugs_incoming: usize,
     bugs_triaged: usize,
     bugs_resolved: usize,
-
     recent_events: Vec<String>,
     total_events: usize,
-
     daily_cost: f64,
     daily_tokens: u64,
     daily_builds: usize,
 }
 
-struct WorkingTask {
+struct TaskSummary {
     id: String,
     developer: String,
     description: String,
 }
 
-fn count_files(dir: &Path) -> usize {
+fn count_json(dir: &Path) -> usize {
     std::fs::read_dir(dir)
-        .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "json")
-        }).count())
+        .map(|e| {
+            e.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
         .unwrap_or(0)
 }
 
-fn scan_working(dir: &Path) -> Vec<WorkingTask> {
-    let mut tasks = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    tasks.push(WorkingTask {
-                        id: val.get("id").and_then(|v| v.as_str()).unwrap_or("?").chars().take(8).collect(),
-                        developer: val.get("owner").and_then(|v| v.as_str()).unwrap_or("?").into(),
-                        description: val.get("messages")
-                            .and_then(|m| m.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|m| m.get("parts"))
-                            .and_then(|p| p.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|p| p.get("data"))
-                            .and_then(|d| d.get("description"))
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("(unknown)")
-                            .chars().take(50).collect(),
-                    });
-                }
-            }
-        }
+fn scan_tasks(dir: &Path) -> Vec<TaskSummary> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        out.push(TaskSummary {
+            id: val
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .chars()
+                .take(8)
+                .collect(),
+            developer: val
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .into(),
+            description: val
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("parts"))
+                .and_then(|p| p.as_array())
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("data"))
+                .and_then(|d| d.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("(unknown)")
+                .chars()
+                .take(60)
+                .collect(),
+        });
     }
-    tasks
+    out
 }
 
-fn scan_ledger(ledger_path: &Path) -> (Vec<String>, usize, f64, u64, usize) {
-    let mut recent = Vec::new();
-    let mut total = 0;
-    let mut daily_cost = 0.0;
-    let mut daily_tokens = 0u64;
-    let mut daily_builds = 0usize;
-
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-
-    if let Ok(content) = std::fs::read_to_string(ledger_path) {
-        for line in content.lines() {
-            if line.trim().is_empty() { continue; }
-            total += 1;
-
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-                let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                let short_tid = &tid[..tid.len().min(8)];
-
-                recent.push(format!("{}  {:25}  {}", &ts[..ts.len().min(19)], event, short_tid));
-
-                // Count daily costs from build.completed/build.failed events
-                if ts.starts_with(&today) && event.starts_with("build.") {
-                    daily_builds += 1;
-                    if let Some(cost) = val.get("cost_usd").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-                        daily_cost += cost;
-                    }
-                    if let Some(tokens) = val.get("total_tokens").and_then(|v| v.as_u64()) {
-                        daily_tokens += tokens;
-                    }
-                }
-            }
-        }
-    }
-
-    // Keep last 15 events
-    let recent: Vec<String> = recent.into_iter().rev().take(15).collect();
-    (recent, total, daily_cost, daily_tokens, daily_builds)
-}
-
-fn scan_state(data_dir: &Path) -> DashboardState {
+fn scan_dashboard(data_dir: &Path) -> DashboardState {
     let tasks = data_dir.join("tasks");
     let promos = data_dir.join("promotions");
     let bugs = data_dir.join("bugs");
     let ledger = data_dir.join("ledger/events.jsonl");
 
-    let (recent_events, total_events, daily_cost, daily_tokens, daily_builds) = scan_ledger(&ledger);
+    let mut recent = Vec::new();
+    let mut total = 0;
+    let mut daily_cost = 0.0;
+    let mut daily_tokens = 0u64;
+    let mut daily_builds = 0usize;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    if let Ok(content) = std::fs::read_to_string(&ledger) {
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            total += 1;
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                let owner = val.get("owner").and_then(|v| v.as_str()).unwrap_or("");
+                let short = &tid[..tid.len().min(8)];
+                let extra = if !owner.is_empty() {
+                    format!("  {}", owner)
+                } else {
+                    String::new()
+                };
+                recent.push(format!(
+                    "{}  {:25}  {}{}",
+                    &ts[..ts.len().min(19)],
+                    event,
+                    short,
+                    extra
+                ));
+
+                if ts.starts_with(&today) && event.starts_with("build.") {
+                    daily_builds += 1;
+                    if let Some(c) = val
+                        .get("cost_usd")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        daily_cost += c;
+                    }
+                    if let Some(t) = val.get("total_tokens").and_then(|v| v.as_u64()) {
+                        daily_tokens += t;
+                    }
+                }
+            }
+        }
+    }
+    recent.reverse();
+    recent.truncate(20);
 
     DashboardState {
-        submitted: count_files(&tasks.join("submitted")),
-        working: scan_working(&tasks.join("working")),
-        completed: count_files(&tasks.join("completed")),
-        failed: count_files(&tasks.join("failed")),
-        canceled: count_files(&tasks.join("canceled")),
-
-        promo_pending: count_files(&promos.join("pending")),
-        promo_approved: count_files(&promos.join("approved")),
-        promo_merged: count_files(&promos.join("merged")),
-        promo_rejected: count_files(&promos.join("rejected")),
-
-        bugs_incoming: count_files(&bugs.join("incoming")),
-        bugs_triaged: count_files(&bugs.join("triaged")),
-        bugs_resolved: count_files(&bugs.join("resolved")),
-
-        recent_events,
-        total_events,
+        submitted: count_json(&tasks.join("submitted")),
+        working: scan_tasks(&tasks.join("working")),
+        completed: count_json(&tasks.join("completed")),
+        failed: count_json(&tasks.join("failed")),
+        canceled: count_json(&tasks.join("canceled")),
+        promo_pending: count_json(&promos.join("pending")),
+        promo_approved: count_json(&promos.join("approved")),
+        promo_merged: count_json(&promos.join("merged")),
+        promo_rejected: count_json(&promos.join("rejected")),
+        bugs_incoming: count_json(&bugs.join("incoming")),
+        bugs_triaged: count_json(&bugs.join("triaged")),
+        bugs_resolved: count_json(&bugs.join("resolved")),
+        recent_events: recent,
+        total_events: total,
         daily_cost,
         daily_tokens,
         daily_builds,
     }
 }
 
-fn ui(f: &mut Frame, state: &DashboardState, data_dir: &Path) {
+fn draw_dashboard(f: &mut Frame, app: &App) {
+    let state = scan_dashboard(&app.data_dir);
     let area = f.area();
 
-    // Main layout: header + 3 columns + footer
-    let main_layout = Layout::vertical([
-        Constraint::Length(3),   // header
-        Constraint::Min(10),    // body
-        Constraint::Length(3),  // footer
-    ]).split(area);
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(10),
+        Constraint::Length(3),
+    ])
+    .split(area);
 
     // Header
     let header = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" OZ Relay Monitor — {} ", data_dir.display()))
+        .title(format!(
+            " OZ Relay Monitor — {} ",
+            app.data_dir.display()
+        ))
         .title_alignment(Alignment::Center);
-    f.render_widget(header, main_layout[0]);
+    f.render_widget(header, layout[0]);
 
     // Body: 3 columns
     let body = Layout::horizontal([
-        Constraint::Percentage(30),
-        Constraint::Percentage(35),
-        Constraint::Percentage(35),
-    ]).split(main_layout[1]);
+        Constraint::Percentage(28),
+        Constraint::Percentage(32),
+        Constraint::Percentage(40),
+    ])
+    .split(layout[1]);
 
-    // Left column: Pipeline + Promotions + Bugs
+    // Left: Pipeline + Promotions + Bugs
     let left = Layout::vertical([
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Min(6),
-    ]).split(body[0]);
+    ])
+    .split(body[0]);
 
-    // Pipeline
-    let working_count = state.working.len();
-    let pipeline_items = vec![
+    let wc = state.working.len();
+    let pipeline = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("  submitted/  ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", state.submitted)),
         ]),
         Line::from(vec![
-            Span::styled("  working/    ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{}", working_count), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" {}", "█".repeat(working_count.min(10)))),
+            Span::styled(
+                "  working/    ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}", wc),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {}", "█".repeat(wc.min(10)))),
         ]),
         Line::from(vec![
             Span::styled("  completed/  ", Style::default().fg(Color::Green)),
@@ -264,84 +378,91 @@ fn ui(f: &mut Frame, state: &DashboardState, data_dir: &Path) {
             Span::styled("  canceled/   ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}", state.canceled)),
         ]),
-    ];
-    let pipeline = Paragraph::new(pipeline_items)
-        .block(Block::default().borders(Borders::ALL).title(" Pipeline "));
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" Pipeline "));
     f.render_widget(pipeline, left[0]);
 
-    // Promotions
-    let promo_items = vec![
+    let promos = Paragraph::new(vec![
         Line::from(format!("  pending/   {}", state.promo_pending)),
         Line::from(format!("  approved/  {}", state.promo_approved)),
         Line::from(format!("  merged/    {}", state.promo_merged)),
         Line::from(format!("  rejected/  {}", state.promo_rejected)),
-    ];
-    let promos = Paragraph::new(promo_items)
-        .block(Block::default().borders(Borders::ALL).title(" Promotions "));
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Promotions "),
+    );
     f.render_widget(promos, left[1]);
 
-    // Bugs
-    let bug_items = vec![
+    let bugs = Paragraph::new(vec![
         Line::from(format!("  incoming/  {}", state.bugs_incoming)),
         Line::from(format!("  triaged/   {}", state.bugs_triaged)),
         Line::from(format!("  resolved/  {}", state.bugs_resolved)),
-    ];
-    let bugs = Paragraph::new(bug_items)
-        .block(Block::default().borders(Borders::ALL).title(" Bugs "));
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" Bugs "));
     f.render_widget(bugs, left[2]);
 
-    // Middle column: Active builds + Cost
-    let middle = Layout::vertical([
-        Constraint::Length(10),
-        Constraint::Min(6),
-    ]).split(body[1]);
+    // Middle: Active builds + Metrics
+    let mid = Layout::vertical([Constraint::Length(10), Constraint::Min(6)]).split(body[1]);
 
-    // Active builds
     let mut build_lines = Vec::new();
     if state.working.is_empty() {
-        build_lines.push(Line::from(Span::styled("  (no active builds)", Style::default().fg(Color::DarkGray))));
+        build_lines.push(Line::from(Span::styled(
+            "  (no active builds)",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
-        for task in &state.working {
+        for t in &state.working {
             build_lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", task.id), Style::default().fg(Color::Cyan)),
-                Span::raw(&task.developer),
+                Span::styled(format!("  {} ", t.id), Style::default().fg(Color::Cyan)),
+                Span::raw(&t.developer),
             ]));
-            build_lines.push(Line::from(format!("    {}", task.description)));
+            build_lines.push(Line::from(format!("    {}", t.description)));
             build_lines.push(Line::from(""));
         }
     }
     let active = Paragraph::new(build_lines)
         .block(Block::default().borders(Borders::ALL).title(" Active Builds "));
-    f.render_widget(active, middle[0]);
+    f.render_widget(active, mid[0]);
 
-    // Cost
-    let total_tasks = state.submitted + state.working.len() + state.completed + state.failed + state.canceled;
-    let success_rate = if state.completed + state.failed > 0 {
+    let total = state.submitted + wc + state.completed + state.failed + state.canceled;
+    let rate = if state.completed + state.failed > 0 {
         (state.completed as f64 / (state.completed + state.failed) as f64 * 100.0) as u32
     } else {
         0
     };
-
-    let cost_items = vec![
+    let metrics = Paragraph::new(vec![
         Line::from(format!("  Builds today    {}", state.daily_builds)),
-        Line::from(format!("  Tokens today    {}", format_tokens(state.daily_tokens))),
+        Line::from(format!(
+            "  Tokens today    {}",
+            fmt_tokens(state.daily_tokens)
+        )),
         Line::from(format!("  Cost today      ${:.2}", state.daily_cost)),
-        Line::from(format!("  Avg cost/build  ${:.2}", if state.daily_builds > 0 { state.daily_cost / state.daily_builds as f64 } else { 0.0 })),
+        Line::from(format!(
+            "  Avg cost/build  ${:.2}",
+            if state.daily_builds > 0 {
+                state.daily_cost / state.daily_builds as f64
+            } else {
+                0.0
+            }
+        )),
         Line::from(""),
-        Line::from(format!("  Total tasks     {}", total_tasks)),
-        Line::from(format!("  Success rate    {}%", success_rate)),
+        Line::from(format!("  Total tasks     {}", total)),
+        Line::from(format!("  Success rate    {}%", rate)),
         Line::from(format!("  Ledger events   {}", state.total_events)),
-    ];
-    let cost = Paragraph::new(cost_items)
-        .block(Block::default().borders(Borders::ALL).title(" Metrics "));
-    f.render_widget(cost, middle[1]);
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" Metrics "));
+    f.render_widget(metrics, mid[1]);
 
-    // Right column: Recent events
-    let event_lines: Vec<Line> = state.recent_events.iter()
+    // Right: Recent events
+    let event_lines: Vec<Line> = state
+        .recent_events
+        .iter()
         .map(|e| {
-            let style = if e.contains("completed") {
+            let style = if e.contains("completed") || e.contains("approved") {
                 Style::default().fg(Color::Green)
-            } else if e.contains("failed") {
+            } else if e.contains("failed") || e.contains("rejected") {
                 Style::default().fg(Color::Red)
             } else if e.contains("bug") {
                 Style::default().fg(Color::Yellow)
@@ -351,22 +472,352 @@ fn ui(f: &mut Frame, state: &DashboardState, data_dir: &Path) {
             Line::from(Span::styled(format!("  {}", e), style))
         })
         .collect();
-
     let events = Paragraph::new(event_lines)
-        .block(Block::default().borders(Borders::ALL).title(" Recent Events (newest first) "));
+        .block(Block::default().borders(Borders::ALL).title(" Recent Events "));
     f.render_widget(events, body[2]);
 
     // Footer
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("  q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": quit   "),
-        Span::raw(format!("refreshes every 2s   {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"))),
+        Span::styled("  d", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("ashboard "),
+        Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("edger "),
+        Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("ailed "),
+        Span::styled("s", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("ubmitted "),
+        Span::styled("w", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("orking "),
+        Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("ompleted "),
+        Span::styled("b", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("ugs "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("uit   "),
+        Span::styled(
+            chrono::Utc::now().format("%H:%M:%S UTC").to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]))
     .block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, main_layout[2]);
+    f.render_widget(footer, layout[2]);
 }
 
-fn format_tokens(tokens: u64) -> String {
+// ---------------------------------------------------------------------------
+// Ledger view — scrollable full event log
+// ---------------------------------------------------------------------------
+
+fn draw_ledger(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(" Ledger — events.jsonl (newest first) ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(header, layout[0]);
+
+    let ledger_path = app.data_dir.join("ledger/events.jsonl");
+    let mut lines = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(&ledger_path) {
+        for line in content.lines().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let rest: Vec<String> = val
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, _)| *k != "ts" && *k != "event")
+                            .map(|(k, v)| {
+                                format!(
+                                    "{}={}",
+                                    k,
+                                    v.as_str()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| v.to_string())
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let style = if event.contains("completed") || event.contains("approved") {
+                    Style::default().fg(Color::Green)
+                } else if event.contains("failed") || event.contains("rejected") {
+                    Style::default().fg(Color::Red)
+                } else if event.contains("bug") {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}  {:25}  {}",
+                        &ts[..ts.len().min(19)],
+                        event,
+                        rest.join("  ")
+                    ),
+                    style,
+                )));
+            } else {
+                lines.push(Line::from(format!("  {}", line)));
+            }
+        }
+    }
+
+    let para = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, layout[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  ↑↓ scroll   "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" back   "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, layout[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Task list view — show tasks from a specific directory
+// ---------------------------------------------------------------------------
+
+fn draw_task_list(f: &mut Frame, app: &App, dir_name: &str) {
+    let area = f.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    let title = format!(" tasks/{}/  ", dir_name);
+    let color = match dir_name {
+        "failed" => Color::Red,
+        "completed" => Color::Green,
+        "working" => Color::Cyan,
+        "submitted" => Color::Yellow,
+        _ => Color::White,
+    };
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(color)))
+        .title_alignment(Alignment::Center);
+    f.render_widget(header, layout[0]);
+
+    let task_dir = app.data_dir.join("tasks").join(dir_name);
+    let mut lines = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&task_dir) {
+        let mut files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        files.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
+
+        for entry in files {
+            if entry.path().extension().is_some_and(|x| x == "json") {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let owner = val.get("owner").and_then(|v| v.as_str()).unwrap_or("?");
+                        let state = val.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                        let updated = val
+                            .get("updatedAt")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        // Get description from intent
+                        let desc = val
+                            .get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|m| m.get("parts"))
+                            .and_then(|p| p.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|p| p.get("data"))
+                            .and_then(|d| d.get("description"))
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("(no description)");
+
+                        // Get agent response if present
+                        let agent_msg = val
+                            .get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|a| {
+                                a.iter().find(|m| {
+                                    m.get("role").and_then(|r| r.as_str()) == Some("agent")
+                                })
+                            })
+                            .and_then(|m| m.get("parts"))
+                            .and_then(|p| p.as_array())
+                            .and_then(|a| a.first());
+
+                        let agent_text = agent_msg
+                            .and_then(|p| p.get("text"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let build_report = agent_msg
+                            .and_then(|p| p.get("data"))
+                            .and_then(|d| d.get("summary"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+
+                        lines.push(Line::from(Span::styled(
+                            format!("  ┌─ {} ──── {} ──── {}", &id[..id.len().min(8)], owner, state),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        )));
+                        lines.push(Line::from(format!(
+                            "  │ Intent: {}",
+                            &desc[..desc.len().min(80)]
+                        )));
+                        lines.push(Line::from(format!(
+                            "  │ Updated: {}",
+                            &updated[..updated.len().min(19)]
+                        )));
+                        if !agent_text.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!("  │ Agent: {}", &agent_text[..agent_text.len().min(80)]),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                        if !build_report.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  │ Report: {}",
+                                    &build_report[..build_report.len().min(80)]
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                        lines.push(Line::from("  └─"));
+                        lines.push(Line::from(""));
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  (no tasks in {}/)", dir_name),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let para = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, layout[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  ↑↓ scroll   "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" back   "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, layout[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Bugs view
+// ---------------------------------------------------------------------------
+
+fn draw_bugs(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(" Bugs — incoming/ ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(header, layout[0]);
+
+    let bugs_dir = app.data_dir.join("bugs/incoming");
+    let mut lines = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&bugs_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let error = val
+                        .get("report")
+                        .and_then(|r| r.get("errorMessage"))
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("?");
+                    let version = val
+                        .get("report")
+                        .and_then(|r| r.get("arcflowVersion"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let received = val
+                        .get("receivedAt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    lines.push(Line::from(Span::styled(
+                        format!("  ┌─ {} ──── v{}", id, version),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(format!(
+                        "  │ Error: {}",
+                        &error[..error.len().min(80)]
+                    )));
+                    lines.push(Line::from(format!(
+                        "  │ Received: {}",
+                        &received[..received.len().min(19)]
+                    )));
+                    lines.push(Line::from("  └─"));
+                    lines.push(Line::from(""));
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no incoming bugs)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let para = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, layout[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  ↑↓ scroll   "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" back   "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, layout[2]);
+}
+
+fn fmt_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
