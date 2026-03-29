@@ -113,7 +113,7 @@ impl TaskManager {
     }
 
     /// Append an event to the ledger.
-    async fn log_event(&self, event: serde_json::Value) {
+    pub async fn log_event(&self, event: serde_json::Value) {
         let line = format!("{}\n", event);
         if let Err(e) = fs::OpenOptions::new()
             .create(true)

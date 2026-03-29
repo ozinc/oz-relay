@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use oz_relay_common::a2a::*;
+use oz_relay_common::bug_report::{self, BugReport, StoredBugReport};
 use oz_relay_common::clarity;
 use oz_relay_common::intent::Intent;
 use oz_relay_common::report;
@@ -34,7 +35,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Public routes (no auth)
     let public = Router::new()
         .route("/.well-known/agent.json", get(agent_card))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/bugs/report", post(handle_bug_report));
 
     // Authenticated routes
     let authenticated = Router::new()
@@ -60,6 +62,92 @@ async fn agent_card(State(state): State<Arc<AppState>>) -> Json<AgentCard> {
 /// GET /health
 async fn health() -> &'static str {
     "ok"
+}
+
+/// POST /bugs/report — public endpoint for end users to report errors.
+/// No authentication required. Rate limited per version string.
+async fn handle_bug_report(
+    State(state): State<Arc<AppState>>,
+    Json(report): Json<BugReport>,
+) -> Response {
+    // Rate limit by version (simple abuse prevention without needing IP)
+    let rate_key = format!("bug_{}", report.arcflow_version);
+    if let Err(retry_after) = state.rate_limiter.check(&rate_key, "professional") {
+        return Json(serde_json::json!({
+            "error": format!("rate limit exceeded, retry after {} seconds", retry_after),
+        }))
+        .into_response();
+    }
+
+    // Validate
+    let errors = bug_report::validate_bug_report(&report);
+    if !errors.is_empty() {
+        return Json(serde_json::json!({
+            "error": "validation failed",
+            "details": errors,
+        }))
+        .into_response();
+    }
+
+    // Generate ID
+    let bug_id = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+
+    let stored = StoredBugReport {
+        id: bug_id.clone(),
+        report: report.clone(),
+        received_at: chrono::Utc::now(),
+        source_hash: format!("{:x}", fnv_hash(report.error_message.as_bytes())),
+        status: "incoming".into(),
+    };
+
+    // Write to bugs/incoming/
+    let bugs_dir = state.config.data_dir.join("bugs/incoming");
+    let bug_file = bugs_dir.join(format!("{}.json", bug_id));
+    let json = serde_json::to_string_pretty(&stored).unwrap();
+
+    if let Err(e) = tokio::fs::write(&bug_file, &json).await {
+        tracing::error!(error = %e, bug_id = %bug_id, "failed to write bug report");
+        return Json(serde_json::json!({"error": "internal error"})).into_response();
+    }
+
+    // Append to ledger
+    state.task_manager.log_event(serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "event": "bug.reported",
+        "bug_id": bug_id,
+        "category": report.category,
+        "arcflow_version": report.arcflow_version,
+        "has_trace": report.stack_trace.is_some(),
+        "has_query": report.query.is_some(),
+    })).await;
+
+    tracing::info!(
+        bug_id = %bug_id,
+        category = %report.category,
+        version = %report.arcflow_version,
+        "bug report received"
+    );
+
+    Json(serde_json::json!({
+        "id": bug_id,
+        "status": "received",
+        "message": "Bug report received. It will be triaged and may result in an automatic fix."
+    }))
+    .into_response()
+}
+
+/// FNV-1a hash for deduplication (not cryptographic).
+fn fnv_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in data {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// POST /a2a — JSON-RPC 2.0 dispatcher
