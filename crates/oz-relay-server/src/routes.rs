@@ -727,7 +727,23 @@ async fn handle_message_send(
                     cost_usd: token_usage.cost_usd,
                     elapsed_secs: total_elapsed.as_secs(),
                 }),
-                artifact: None, // TODO: compile and sign artifact
+                artifact: if success {
+                    // Artifact compilation happens in the promotion queue (RLY-0014).
+                    // The artifact is compiled from the preserved branch when OZ approves.
+                    let target = std::env::consts::ARCH.to_string()
+                        + "-unknown-"
+                        + std::env::consts::OS
+                        + "-gnu";
+                    Some(report::ArtifactReport {
+                        name: report::artifact_name(&developer, &intent_desc, &task_id.to_string(), &target),
+                        size_bytes: 0, // Populated when artifact is compiled
+                        sha256: String::new(),
+                        signed: false,
+                        target_triple: target,
+                    })
+                } else {
+                    None
+                },
             };
 
             // Add build report as agent response
