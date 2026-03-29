@@ -79,10 +79,13 @@ async fn a2a_endpoint(
     let claims = match claims {
         Some(axum::Extension(c)) => c,
         None => {
+            tracing::warn!(method = %req.method, "unauthenticated request");
             return Json(JsonRpcResponse::error(req.id, ERR_UNAUTHORIZED, "unauthorized"))
                 .into_response()
         }
     };
+
+    tracing::debug!(method = %req.method, sub = %claims.sub, tier = %claims.tier, status = %claims.status, "a2a request");
 
     match req.method.as_str() {
         "message/send" => handle_message_send(state, claims, req).await,
@@ -170,6 +173,14 @@ async fn handle_message_send(
     let task = state.task_manager.create_task(&claims.sub, message);
     let task_id = task.id;
 
+    tracing::info!(
+        task_id = %task_id,
+        owner = %claims.sub,
+        category = %intent.category,
+        description = %intent.description,
+        "task created"
+    );
+
     // Spawn the build session in the background if source repo is configured
     if let Some(ref source_repo) = state.config.source_repo {
         let source_repo = source_repo.clone();
@@ -177,20 +188,27 @@ async fn handle_message_send(
         let task_manager = state.clone();
 
         tokio::spawn(async move {
+            let start = std::time::Instant::now();
+
             // Transition to Working
             let _ = task_manager.task_manager.transition_task(task_id, TaskState::Working);
+            tracing::info!(task_id = %task_id, "build started");
 
             // Create worktree
             let session_id = task_id.to_string();
             let worktree = match sandbox::create_worktree(&source_repo, &session_id).await {
-                Ok(w) => w,
+                Ok(w) => {
+                    tracing::info!(task_id = %task_id, worktree = %w.display(), "worktree created");
+                    w
+                }
                 Err(e) => {
+                    tracing::error!(task_id = %task_id, error = %e, "worktree creation failed");
                     let _ = task_manager.task_manager.add_message(
                         task_id,
                         Message {
                             role: MessageRole::Agent,
                             parts: vec![Part::Text {
-                                text: format!("Build setup failed: {}", response_filter::filter_response(&e)),
+                                text: "Build setup failed.".into(),
                             }],
                         },
                     );
@@ -201,12 +219,13 @@ async fn handle_message_send(
 
             // Prepare worktree with CLAUDE.md and prompt
             if let Err(e) = agent_bridge::prepare_worktree(&worktree, &intent).await {
+                tracing::error!(task_id = %task_id, error = %e, "worktree preparation failed");
                 let _ = task_manager.task_manager.add_message(
                     task_id,
                     Message {
                         role: MessageRole::Agent,
                         parts: vec![Part::Text {
-                            text: format!("Build setup failed: {}", response_filter::filter_response(&e)),
+                            text: "Build setup failed.".into(),
                         }],
                     },
                 );
@@ -214,6 +233,7 @@ async fn handle_message_send(
                 let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
                 return;
             }
+            tracing::info!(task_id = %task_id, "prompt written, launching claude");
 
             // Run Claude Code headless in the worktree
             let prompt_path = worktree.join(".relay-prompt.md");
@@ -229,9 +249,46 @@ async fn handle_message_send(
             )
             .await;
 
+            let claude_elapsed = start.elapsed();
+            tracing::info!(
+                task_id = %task_id,
+                exit_code = agent_result.exit_code,
+                timed_out = agent_result.timed_out,
+                stdout_len = agent_result.stdout.len(),
+                stderr_len = agent_result.stderr.len(),
+                elapsed_secs = claude_elapsed.as_secs(),
+                "claude session finished"
+            );
+
+            if agent_result.exit_code != 0 {
+                tracing::warn!(
+                    task_id = %task_id,
+                    exit_code = agent_result.exit_code,
+                    stderr = %agent_result.stderr.chars().take(500).collect::<String>(),
+                    "claude exited with non-zero code"
+                );
+            }
+
             // Run cargo test
+            tracing::info!(task_id = %task_id, "running cargo test");
             let test_result = agent_bridge::run_cargo_test(&worktree, timeout).await;
             let (passed, failed) = agent_bridge::parse_test_results(&test_result.stdout);
+
+            tracing::info!(
+                task_id = %task_id,
+                test_exit_code = test_result.exit_code,
+                tests_passed = passed,
+                tests_failed = failed,
+                "cargo test finished"
+            );
+
+            if test_result.exit_code != 0 {
+                tracing::warn!(
+                    task_id = %task_id,
+                    stderr = %test_result.stderr.chars().take(500).collect::<String>(),
+                    "cargo test failed"
+                );
+            }
 
             // Build the filtered summary
             let raw_summary = if agent_result.timed_out {
@@ -256,15 +313,29 @@ async fn handle_message_send(
             );
 
             // Transition based on test results
-            if test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out {
+            let final_state = if test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out {
                 let _ = task_manager.task_manager.transition_task(task_id, TaskState::Completed);
+                "completed"
             } else {
                 let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
-            }
+                "failed"
+            };
 
             // Cleanup worktree
             let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
+
+            let total_elapsed = start.elapsed();
+            tracing::info!(
+                task_id = %task_id,
+                final_state = final_state,
+                tests_passed = passed,
+                tests_failed = failed,
+                total_secs = total_elapsed.as_secs(),
+                "build pipeline complete"
+            );
         });
+    } else {
+        tracing::warn!(task_id = %task_id, "no source_repo configured — task stays in submitted state");
     }
 
     Json(JsonRpcResponse::success(
