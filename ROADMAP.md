@@ -15,7 +15,21 @@ Waves are ordered by dependency. Each wave is self-contained with exit criteria.
 - **RLY-0008**: Clarity gate — EARS-inspired scoring, rejects vague intents (saves tokens)
 - **RLY-0009**: Deployment — systemd, Cloudflare tunnel, Ed25519 keys, firewall
 
-### Upcoming
+- **RLY-0010**: OTEL error bridge — `/bugs/report` endpoint, BugReport schema
+- **RLY-0011**: Bug triage automation — auto-generate intents from clear bug reports
+- **RLY-0012**: Token tracking — cost estimation in build reports and ledger
+- **RLY-0013**: Promotion queue — `/promotions/list`, approve, reject endpoints
+- **RLY-0014**: Artifact report — naming convention, target triple, report structure
+- **RLY-0015**: SSE progress streaming — real-time build updates via Server-Sent Events
+- **RLY-0016**: TUI monitor — `oz-relay-monitor` ratatui dashboard
+- **RLY-0018**: nsjail v3.4 installed — production sandbox ready
+- **RLY-0020**: Rate limit persistence — counters restored from ledger on startup
+
+### In Progress
+- **RLY-0017**: CLI consolidation — `arcflow relay` subcommand (standalone `arcflow-relay` works)
+
+### Blocked
+- **RLY-0019**: Named Cloudflare tunnel — waiting for Route53/DNS access
 
 ---
 
