@@ -15,6 +15,8 @@ pub struct ServerConfig {
     pub nsjail_config: Option<String>,
     pub source_repo: Option<PathBuf>,
     pub sandbox_timeout_secs: u64,
+    /// Root directory for tasks, ledger, promotions, bugs.
+    pub data_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,9 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1800),
+            data_dir: std::env::var("RELAY_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/opt/oz-relay")),
         }
     }
 
@@ -62,6 +67,7 @@ impl ServerConfig {
             nsjail_config: None,
             source_repo: None,
             sandbox_timeout_secs: 1800,
+            data_dir: std::env::temp_dir().join("oz-relay-test"),
         }
     }
 }

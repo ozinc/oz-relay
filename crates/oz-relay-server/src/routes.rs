@@ -186,7 +186,7 @@ async fn handle_message_send(
     );
 
     // Create the task with owner from JWT claims
-    let task = state.task_manager.create_task(&claims.sub, message);
+    let task = state.task_manager.create_task(&claims.sub, message).await;
     let task_id = task.id;
 
     tracing::info!(
@@ -211,7 +211,7 @@ async fn handle_message_send(
             let start = std::time::Instant::now();
 
             // Transition to Working
-            let _ = task_manager.task_manager.transition_task(task_id, TaskState::Working);
+            let _ = task_manager.task_manager.transition_task(task_id, TaskState::Working).await;
             tracing::info!(task_id = %task_id, branch = %branch_name, "build started");
 
             // Create worktree
@@ -232,7 +232,7 @@ async fn handle_message_send(
                             }],
                         },
                     );
-                    let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                    let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed).await;
                     return;
                 }
             };
@@ -249,7 +249,7 @@ async fn handle_message_send(
                         }],
                     },
                 );
-                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed).await;
                 let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
                 return;
             }
@@ -347,7 +347,7 @@ async fn handle_message_send(
 
             // Transition based on test results
             let final_state = if success {
-                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Completed);
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Completed).await;
 
                 // Keep the branch for promotion — write metadata to promotions queue
                 let metadata = serde_json::json!({
@@ -372,7 +372,7 @@ async fn handle_message_send(
 
                 "completed"
             } else {
-                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed);
+                let _ = task_manager.task_manager.transition_task(task_id, TaskState::Failed).await;
                 // Failed builds: clean up the worktree
                 let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
                 "failed"
@@ -439,7 +439,7 @@ async fn handle_message_stream(
     };
 
     // FIX #5: Only return tasks owned by the requesting developer
-    let task = match state.task_manager.get_task_for_owner(task_id, &claims.sub) {
+    let task = match state.task_manager.get_task_for_owner(task_id, &claims.sub).await {
         Some(t) => t,
         None => {
             return Json(JsonRpcResponse::error(
@@ -491,7 +491,7 @@ async fn handle_tasks_get(
     };
 
     // FIX #5: Only return tasks owned by the requesting developer
-    match state.task_manager.get_task_for_owner(task_id, &claims.sub) {
+    match state.task_manager.get_task_for_owner(task_id, &claims.sub).await {
         Some(task) => Json(JsonRpcResponse::success(
             req.id,
             serde_json::to_value(&task).unwrap(),
@@ -538,6 +538,7 @@ async fn handle_tasks_cancel(
     match state
         .task_manager
         .transition_task_for_owner(task_id, &claims.sub, TaskState::Canceled)
+        .await
     {
         Ok(task) => Json(JsonRpcResponse::success(
             req.id,
@@ -800,7 +801,7 @@ mod tests {
                 text: "test".into(),
             }],
         };
-        let task = state.task_manager.create_task("dev_test", msg);
+        let task = state.task_manager.create_task("dev_test", msg).await;
 
         let app = build_router(state.clone());
         let body = serde_json::json!({
@@ -883,7 +884,7 @@ mod tests {
                 text: "test".into(),
             }],
         };
-        let task = state.task_manager.create_task("dev_alice", msg);
+        let task = state.task_manager.create_task("dev_alice", msg).await;
 
         // Developer B tries to access it
         let app = build_router(state.clone());
@@ -1075,7 +1076,7 @@ mod tests {
             role: MessageRole::User,
             parts: vec![Part::Text { text: "test".into() }],
         };
-        let task = state.task_manager.create_task("dev_pending", msg);
+        let task = state.task_manager.create_task("dev_pending", msg).await;
 
         let app = build_router(state.clone());
         let pending_token = RelayClaims::sign_with_status("dev_pending", "community", "pending", secret);

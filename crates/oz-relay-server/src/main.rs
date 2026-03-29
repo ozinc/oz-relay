@@ -51,8 +51,10 @@ async fn main() {
         "oz-relay-server starting"
     );
 
+    let task_manager = TaskManager::init(&config.data_dir).await;
+
     let state = Arc::new(AppState {
-        task_manager: TaskManager::new(),
+        task_manager,
         rate_limiter: RateLimiter::new(config.rate_limits.clone()),
         config,
     });
