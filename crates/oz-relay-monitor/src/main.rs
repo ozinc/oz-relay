@@ -31,18 +31,22 @@ use ratatui::widgets::*;
 enum View {
     Dashboard,
     Ledger,
-    EventDetail, // full-screen view of a single ledger event + associated task/bug
+    EventDetail,
     TaskList(String),
+    TaskDetail(String), // dir name — inspecting a task
     Bugs,
+    BugDetail,
 }
 
 struct App {
     view: View,
     scroll: u16,
-    /// Cursor position in the ledger list (for Enter-to-inspect).
+    /// Cursor position in list views (ledger, bugs, tasks).
     cursor: usize,
     /// Cached ledger lines (raw JSON) for inspection.
     ledger_lines: Vec<String>,
+    /// Cached file paths for current list view (bugs/tasks).
+    list_files: Vec<PathBuf>,
     data_dir: PathBuf,
 }
 
@@ -55,6 +59,7 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(crossterm::event::EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App {
@@ -62,11 +67,13 @@ fn main() -> io::Result<()> {
         scroll: 0,
         cursor: 0,
         ledger_lines: Vec::new(),
+        list_files: Vec::new(),
         data_dir: PathBuf::from(data_dir),
     };
 
     let result = run_app(&mut terminal, &mut app);
 
+    io::stdout().execute(crossterm::event::DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     result
@@ -84,13 +91,52 @@ fn run_app(
         if app.view == View::Ledger || app.view == View::EventDetail {
             app.ledger_lines = load_ledger_lines(&app.data_dir);
         }
+        if app.view == View::Bugs || app.view == View::BugDetail {
+            app.list_files = list_json_files(&app.data_dir.join("bugs/incoming"));
+        }
+        if let View::TaskList(ref dir) = app.view {
+            app.list_files = list_json_files(&app.data_dir.join("tasks").join(dir));
+        }
+        if let View::TaskDetail(ref dir) = app.view {
+            app.list_files = list_json_files(&app.data_dir.join("tasks").join(dir));
+        }
         let app_ref = &*app;
         terminal.draw(|f| draw_view(f, app_ref))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
+            let ev = event::read()?;
+
+            // Mouse scroll support
+            if let Event::Mouse(mouse) = ev {
+                match mouse.kind {
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        if has_cursor_nav(&app.view) {
+                            let max = list_len(app);
+                            app.cursor = (app.cursor + 3).min(max);
+                            auto_scroll_cursor(app);
+                        } else {
+                            app.scroll = app.scroll.saturating_add(3);
+                        }
+                    }
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        if has_cursor_nav(&app.view) {
+                            app.cursor = app.cursor.saturating_sub(3);
+                            if (app.cursor as u16) < app.scroll {
+                                app.scroll = app.cursor as u16;
+                            }
+                        } else {
+                            app.scroll = app.scroll.saturating_sub(3);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let Event::Key(key) = ev else { continue };
+
+            match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(())
@@ -102,57 +148,74 @@ fn run_app(
                     KeyCode::Char('l') => {
                         app.view = View::Ledger;
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Char('f') => {
                         app.view = View::TaskList("failed".into());
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Char('s') => {
                         app.view = View::TaskList("submitted".into());
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Char('w') => {
                         app.view = View::TaskList("working".into());
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Char('c') => {
                         app.view = View::TaskList("completed".into());
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Char('b') => {
                         app.view = View::Bugs;
                         app.scroll = 0;
+                        app.cursor = 0;
                     }
                     KeyCode::Enter => {
-                        if app.view == View::Ledger && !app.ledger_lines.is_empty() {
-                            app.view = View::EventDetail;
-                            app.scroll = 0;
+                        match &app.view {
+                            View::Ledger if !app.ledger_lines.is_empty() => {
+                                app.view = View::EventDetail;
+                                app.scroll = 0;
+                            }
+                            View::Bugs if !app.list_files.is_empty() => {
+                                app.view = View::BugDetail;
+                                app.scroll = 0;
+                            }
+                            View::TaskList(dir) if !app.list_files.is_empty() => {
+                                app.view = View::TaskDetail(dir.clone());
+                                app.scroll = 0;
+                            }
+                            _ => {}
                         }
                     }
                     KeyCode::Esc | KeyCode::Backspace => {
-                        if app.view == View::EventDetail {
-                            app.view = View::Ledger;
-                            app.scroll = 0;
-                        } else {
-                            app.view = View::Dashboard;
-                            app.scroll = 0;
-                        }
+                        app.view = match &app.view {
+                            View::EventDetail => View::Ledger,
+                            View::BugDetail => View::Bugs,
+                            View::TaskDetail(_) => {
+                                // Go back to the task list we came from
+                                // We can't easily recover the dir, so go to dashboard
+                                View::Dashboard
+                            }
+                            _ => View::Dashboard,
+                        };
+                        app.scroll = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if app.view == View::Ledger {
-                            let max = app.ledger_lines.len().saturating_sub(1);
+                        if has_cursor_nav(&app.view) {
+                            let max = list_len(app);
                             app.cursor = (app.cursor + 1).min(max);
-                            // Auto-scroll to keep cursor visible
-                            let visible_height = 20u16; // approximate
-                            if app.cursor as u16 >= app.scroll + visible_height {
-                                app.scroll = (app.cursor as u16).saturating_sub(visible_height - 1);
-                            }
+                            auto_scroll_cursor(app);
                         } else {
                             app.scroll = app.scroll.saturating_add(1);
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if app.view == View::Ledger {
+                        if has_cursor_nav(&app.view) {
                             app.cursor = app.cursor.saturating_sub(1);
                             if (app.cursor as u16) < app.scroll {
                                 app.scroll = app.cursor as u16;
@@ -162,25 +225,57 @@ fn run_app(
                         }
                     }
                     KeyCode::PageDown => {
-                        app.scroll = app.scroll.saturating_add(20);
-                        if app.view == View::Ledger {
-                            app.cursor = (app.cursor + 20).min(app.ledger_lines.len().saturating_sub(1));
+                        if has_cursor_nav(&app.view) {
+                            let max = list_len(app);
+                            app.cursor = (app.cursor + 20).min(max);
+                            auto_scroll_cursor(app);
                         }
+                        app.scroll = app.scroll.saturating_add(20);
                     }
                     KeyCode::PageUp => {
-                        app.scroll = app.scroll.saturating_sub(20);
-                        if app.view == View::Ledger {
+                        if has_cursor_nav(&app.view) {
                             app.cursor = app.cursor.saturating_sub(20);
                         }
+                        app.scroll = app.scroll.saturating_sub(20);
                     }
                     _ => {}
                 }
-            }
         }
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
         }
     }
+}
+
+fn has_cursor_nav(view: &View) -> bool {
+    matches!(view, View::Ledger | View::Bugs | View::TaskList(_))
+}
+
+fn list_len(app: &App) -> usize {
+    match &app.view {
+        View::Ledger => app.ledger_lines.len().saturating_sub(1),
+        View::Bugs | View::TaskList(_) => app.list_files.len().saturating_sub(1),
+        _ => 0,
+    }
+}
+
+fn auto_scroll_cursor(app: &mut App) {
+    let visible_height = 20u16;
+    if app.cursor as u16 >= app.scroll + visible_height {
+        app.scroll = (app.cursor as u16).saturating_sub(visible_height - 1);
+    }
+}
+
+fn list_json_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .map(|e| e.path())
+        .collect();
+    files.sort_by(|a, b| b.cmp(a)); // newest first by filename
+    files
 }
 
 fn load_ledger_lines(data_dir: &Path) -> Vec<String> {
@@ -202,7 +297,9 @@ fn draw_view(f: &mut Frame, app: &App) {
         View::Ledger => draw_ledger(f, app),
         View::EventDetail => draw_event_detail(f, app),
         View::TaskList(dir) => draw_task_list(f, app, dir),
+        View::TaskDetail(dir) => draw_file_detail(f, app, &app.data_dir.join("tasks").join(dir)),
         View::Bugs => draw_bugs(f, app),
+        View::BugDetail => draw_file_detail(f, app, &app.data_dir.join("bugs/incoming")),
     }
 }
 
@@ -1065,64 +1162,48 @@ fn draw_bugs(f: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Min(5),
         Constraint::Length(3),
-    ])
-    .split(area);
+    ]).split(area);
 
+    let count = app.list_files.len();
     let header = Block::default()
         .borders(Borders::ALL)
-        .title(" Bugs — incoming/ ")
+        .title(format!(" Bugs — incoming/ ({}) — ↑↓ mouse/keys, Enter to inspect ", count))
         .title_alignment(Alignment::Center);
     f.render_widget(header, layout[0]);
 
-    let bugs_dir = app.data_dir.join("bugs/incoming");
     let mut lines = Vec::new();
+    for (i, path) in app.list_files.iter().enumerate() {
+        let is_selected = i == app.cursor;
+        let bg = if is_selected { Color::DarkGray } else { Color::Reset };
 
-    if let Ok(entries) = std::fs::read_dir(&bugs_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                    let error = val
-                        .get("report")
-                        .and_then(|r| r.get("errorMessage"))
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("?");
-                    let version = val
-                        .get("report")
-                        .and_then(|r| r.get("arcflowVersion"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let received = val
-                        .get("receivedAt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let error = val.get("report").and_then(|r| r.get("errorMessage")).and_then(|e| e.as_str()).unwrap_or("?");
+                let version = val.get("report").and_then(|r| r.get("arcflowVersion")).and_then(|v| v.as_str()).unwrap_or("?");
+                let occ = val.get("occurrences").and_then(|o| o.as_u64()).unwrap_or(1);
+                let query = val.get("report").and_then(|r| r.get("query")).and_then(|q| q.as_str()).unwrap_or("");
 
+                let occ_str = if occ > 1 { format!(" (x{})", occ) } else { String::new() };
+                let style = Style::default().fg(Color::Yellow).bg(bg);
+                let bold = if is_selected { style.add_modifier(Modifier::BOLD) } else { style };
+
+                lines.push(Line::from(Span::styled(
+                    format!("  {} │ v{}{} │ {}", id, version, occ_str, &error[..error.len().min(60)]),
+                    bold,
+                )));
+                if !query.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        format!("  ┌─ {} ──── v{}", id, version),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        format!("  {:>28} │ query: {}", "", &query[..query.len().min(50)]),
+                        Style::default().fg(Color::DarkGray).bg(bg),
                     )));
-                    lines.push(Line::from(format!(
-                        "  │ Error: {}",
-                        &error[..error.len().min(80)]
-                    )));
-                    lines.push(Line::from(format!(
-                        "  │ Received: {}",
-                        &received[..received.len().min(19)]
-                    )));
-                    lines.push(Line::from("  └─"));
-                    lines.push(Line::from(""));
                 }
             }
         }
     }
 
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no incoming bugs)",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("  (no incoming bugs)", Style::default().fg(Color::DarkGray))));
     }
 
     let para = Paragraph::new(lines)
@@ -1131,7 +1212,9 @@ fn draw_bugs(f: &mut Frame, app: &App) {
     f.render_widget(para, layout[1]);
 
     let footer = Paragraph::new(Line::from(vec![
-        Span::raw("  ↑↓ scroll   "),
+        Span::raw("  ↑↓/mouse scroll   "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" inspect   "),
         Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" back   "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
@@ -1139,6 +1222,188 @@ fn draw_bugs(f: &mut Frame, app: &App) {
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, layout[2]);
+}
+
+// ---------------------------------------------------------------------------
+// File detail view — full-screen JSON inspection of a bug or task
+// ---------------------------------------------------------------------------
+
+fn draw_file_detail(f: &mut Frame, app: &App, _dir: &Path) {
+    let area = f.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ]).split(area);
+
+    let Some(path) = app.list_files.get(app.cursor) else {
+        let empty = Paragraph::new("  (no file selected)")
+            .block(Block::default().borders(Borders::ALL).title(" Detail "));
+        f.render_widget(empty, area);
+        return;
+    };
+
+    let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("?");
+
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", filename))
+        .title_alignment(Alignment::Center);
+    f.render_widget(header, layout[0]);
+
+    let mut lines = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            // For bug reports: show structured fields first
+            if let Some(report) = val.get("report") {
+                let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let occ = val.get("occurrences").and_then(|o| o.as_u64()).unwrap_or(1);
+                let fp = val.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("");
+                let received = val.get("receivedAt").and_then(|v| v.as_str()).unwrap_or("");
+                let last_seen = val.get("lastSeenAt").and_then(|v| v.as_str()).unwrap_or("—");
+
+                lines.push(Line::from(Span::styled("  Bug Report", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+                lines.push(Line::from(format!("  ID:          {}", id)));
+                lines.push(Line::from(format!("  Occurrences: {}", occ)));
+                lines.push(Line::from(format!("  Fingerprint: {}", fp)));
+                lines.push(Line::from(format!("  Received:    {}", received)));
+                lines.push(Line::from(format!("  Last seen:   {}", last_seen)));
+                lines.push(Line::from(""));
+
+                let err = report.get("errorMessage").and_then(|e| e.as_str()).unwrap_or("");
+                let ver = report.get("arcflowVersion").and_then(|v| v.as_str()).unwrap_or("");
+                let cat = report.get("category").and_then(|c| c.as_str()).unwrap_or("");
+                let query = report.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                let trace = report.get("stackTrace").and_then(|t| t.as_str()).unwrap_or("");
+                let ctx = report.get("context").and_then(|c| c.as_str()).unwrap_or("");
+                let target = report.get("targetTriple").and_then(|t| t.as_str()).unwrap_or("");
+
+                lines.push(Line::from(Span::styled("  Error Message:", Style::default().add_modifier(Modifier::BOLD))));
+                for l in word_wrap(err, 80) {
+                    lines.push(Line::from(format!("    {}", l)));
+                }
+                lines.push(Line::from(""));
+
+                lines.push(Line::from(format!("  Version:     {}", ver)));
+                lines.push(Line::from(format!("  Category:    {}", cat)));
+                if !target.is_empty() {
+                    lines.push(Line::from(format!("  Target:      {}", target)));
+                }
+                lines.push(Line::from(""));
+
+                if !query.is_empty() {
+                    lines.push(Line::from(Span::styled("  Query:", Style::default().add_modifier(Modifier::BOLD))));
+                    lines.push(Line::from(format!("    {}", query)));
+                    lines.push(Line::from(""));
+                }
+
+                if !trace.is_empty() {
+                    lines.push(Line::from(Span::styled("  Stack Trace:", Style::default().add_modifier(Modifier::BOLD))));
+                    for l in trace.lines() {
+                        lines.push(Line::from(format!("    {}", l)));
+                    }
+                    lines.push(Line::from(""));
+                }
+
+                if !ctx.is_empty() {
+                    lines.push(Line::from(Span::styled("  Context:", Style::default().add_modifier(Modifier::BOLD))));
+                    for l in word_wrap(ctx, 80) {
+                        lines.push(Line::from(format!("    {}", l)));
+                    }
+                    lines.push(Line::from(""));
+                }
+            } else {
+                // For tasks: show structured fields
+                let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let state = val.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                let owner = val.get("owner").and_then(|v| v.as_str()).unwrap_or("?");
+
+                lines.push(Line::from(Span::styled("  Task", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))));
+                lines.push(Line::from(format!("  ID:    {}", id)));
+                lines.push(Line::from(format!("  State: {}", state)));
+                lines.push(Line::from(format!("  Owner: {}", owner)));
+                lines.push(Line::from(""));
+
+                // Intent
+                if let Some(desc) = val.get("messages").and_then(|m| m.as_array()).and_then(|a| a.first())
+                    .and_then(|m| m.get("parts")).and_then(|p| p.as_array()).and_then(|a| a.first())
+                    .and_then(|p| p.get("data"))
+                {
+                    lines.push(Line::from(Span::styled("  Intent:", Style::default().add_modifier(Modifier::BOLD))));
+                    if let Some(d) = desc.get("description").and_then(|d| d.as_str()) {
+                        for l in word_wrap(d, 80) { lines.push(Line::from(format!("    {}", l))); }
+                    }
+                    if let Some(m) = desc.get("motivation").and_then(|m| m.as_str()) {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled("  Motivation:", Style::default().add_modifier(Modifier::BOLD))));
+                        for l in word_wrap(m, 80) { lines.push(Line::from(format!("    {}", l))); }
+                    }
+                    lines.push(Line::from(""));
+                }
+
+                // Agent responses
+                if let Some(msgs) = val.get("messages").and_then(|m| m.as_array()) {
+                    for msg in msgs {
+                        if msg.get("role").and_then(|r| r.as_str()) == Some("agent") {
+                            lines.push(Line::from(Span::styled("  Agent Response:", Style::default().add_modifier(Modifier::BOLD))));
+                            if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                                for part in parts {
+                                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                        for l in word_wrap(text, 80) { lines.push(Line::from(format!("    {}", l))); }
+                                    }
+                                    if let Some(data) = part.get("data") {
+                                        let pretty = serde_json::to_string_pretty(data).unwrap_or_default();
+                                        for l in pretty.lines() { lines.push(Line::from(format!("    {}", l))); }
+                                    }
+                                }
+                            }
+                            lines.push(Line::from(""));
+                        }
+                    }
+                }
+            }
+
+            // Raw JSON at bottom
+            lines.push(Line::from(Span::styled("  Raw JSON:", Style::default().fg(Color::DarkGray))));
+            let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
+            for l in pretty.lines() {
+                lines.push(Line::from(Span::styled(format!("    {}", l), Style::default().fg(Color::DarkGray))));
+            }
+        } else {
+            lines.push(Line::from(format!("  {}", content)));
+        }
+    }
+
+    let para = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, layout[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  ↑↓/mouse scroll   "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" back   "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, layout[2]);
+}
+
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.len() + word.len() + 1 > width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() { current.push(' '); }
+        current.push_str(word);
+    }
+    if !current.is_empty() { lines.push(current); }
+    if lines.is_empty() { lines.push(String::new()); }
+    lines
 }
 
 fn fmt_tokens(tokens: u64) -> String {
