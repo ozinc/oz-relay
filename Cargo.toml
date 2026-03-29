@@ -2,6 +2,7 @@
 members = [
     "crates/oz-relay-common",
     "crates/oz-relay-server",
+    "crates/oz-relay-monitor",
 ]
 resolver = "2"
 

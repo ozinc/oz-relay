@@ -41,6 +41,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Authenticated routes
     let authenticated = Router::new()
         .route("/a2a", post(a2a_endpoint))
+        .route("/bugs/triage", post(handle_bug_triage))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -136,6 +137,111 @@ async fn handle_bug_report(
         "id": bug_id,
         "status": "received",
         "message": "Bug report received. It will be triaged and may result in an automatic fix."
+    }))
+    .into_response()
+}
+
+/// POST /bugs/triage — authenticated endpoint to triage incoming bug reports.
+/// Scans bugs/incoming/, runs clarity heuristics, moves clear bugs to bugs/triaged/.
+async fn handle_bug_triage(
+    State(state): State<Arc<AppState>>,
+    _claims: Option<axum::Extension<RelayClaims>>,
+) -> Response {
+    let incoming_dir = state.config.data_dir.join("bugs/incoming");
+    let triaged_dir = state.config.data_dir.join("bugs/triaged");
+
+    // Ensure triaged directory exists
+    if let Err(e) = tokio::fs::create_dir_all(&triaged_dir).await {
+        tracing::error!(error = %e, "failed to create bugs/triaged directory");
+        return Json(serde_json::json!({"error": "internal error"})).into_response();
+    }
+
+    let mut entries = match tokio::fs::read_dir(&incoming_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to read bugs/incoming");
+            return Json(serde_json::json!({"error": "internal error"})).into_response();
+        }
+    };
+
+    let mut triaged = Vec::new();
+    let mut needs_info_list = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut stored: StoredBugReport = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "corrupt bug report");
+                continue;
+            }
+        };
+
+        let result = bug_report::triage_bug(&stored);
+
+        if result.can_convert {
+            stored.status = "triaged".into();
+
+            // Write to triaged/ with generated intent attached
+            let triaged_file = triaged_dir.join(entry.file_name());
+            let triaged_data = serde_json::json!({
+                "bug_report": stored,
+                "generated_intent": result.generated_intent,
+            });
+            if let Err(e) = tokio::fs::write(
+                &triaged_file,
+                serde_json::to_string_pretty(&triaged_data).unwrap(),
+            )
+            .await
+            {
+                tracing::error!(error = %e, "failed to write triaged bug");
+                continue;
+            }
+
+            // Remove from incoming
+            let _ = tokio::fs::remove_file(&path).await;
+
+            state
+                .task_manager
+                .log_event(serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": "bug.triaged",
+                    "bug_id": stored.id,
+                    "category": stored.report.category,
+                }))
+                .await;
+
+            triaged.push(stored.id.clone());
+        } else {
+            state
+                .task_manager
+                .log_event(serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": "bug.needs_info",
+                    "bug_id": stored.id,
+                    "needs_info": result.needs_info,
+                }))
+                .await;
+
+            needs_info_list.push(serde_json::json!({
+                "bug_id": stored.id,
+                "needs_info": result.needs_info,
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "triaged": triaged,
+        "needs_info": needs_info_list,
     }))
     .into_response()
 }

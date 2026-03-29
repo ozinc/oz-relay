@@ -1,0 +1,18 @@
+[package]
+name = "oz-relay-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TUI dashboard for the OZ Relay pipeline — reads filesystem state, no server dependency"
+
+[[bin]]
+name = "oz-relay-monitor"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
