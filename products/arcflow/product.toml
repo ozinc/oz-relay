@@ -1,0 +1,23 @@
+# ArcFlow product configuration for OZ Relay
+# This defines how the relay builds and serves ArcFlow intents.
+
+[product]
+name = "arcflow"
+display_name = "ArcFlow Graph Database"
+source_repo = "/opt/arcflow/repo.git"
+build_command = "cargo build --release"
+test_command = "cargo test"
+
+[signing]
+key_path = "/opt/oz-relay/keys/signing.pkcs8"
+public_key_path = "/opt/oz-relay/keys/signing.pub"
+
+[sandbox]
+timeout_seconds = 1800
+nsjail_config = "/opt/oz-relay/config/nsjail.cfg"
+enable_gpu = true
+
+[rate_limits]
+community_per_day = 3
+professional_per_day = 10
+enterprise_per_day = 1000

@@ -1,0 +1,12 @@
+# OZ Relay — cron jobs
+# Installed to /etc/cron.d/oz-relay
+
+# Pull latest source every 5 minutes
+*/5 * * * * oz-relay cd /opt/arcflow/repo.git && git fetch origin main:main 2>/dev/null
+
+# FIX #9: Clean orphaned worktrees — only remove if no active nsjail/cargo process
+# is using the worktree. Checks for active PIDs before deleting.
+0 * * * * oz-relay /opt/oz-relay/bin/cleanup-worktrees.sh 2>/dev/null || true
+
+# Rotate relay server logs weekly (Caddy handles its own rotation now)
+0 0 * * 0 oz-relay find /opt/oz-relay/logs -name "*.log" -size +100M -exec truncate -s 0 {} \;

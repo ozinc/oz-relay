@@ -1,0 +1,31 @@
+# OZ Relay — Caddy reverse proxy
+# Auto-provisions TLS via Let's Encrypt.
+
+relay.oz.global {
+    reverse_proxy localhost:3400
+
+    header {
+        # Security headers
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        Referrer-Policy "no-referrer"
+        X-XSS-Protection "1; mode=block"
+
+        # FIX #6: No CORS headers — CLI clients don't need them.
+        # If browser access is needed later, restrict to specific origins.
+
+        # Remove server identification
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/relay-access.log {
+            # FIX #15: Log rotation — 100MB max, keep 5 rotated files
+            roll_size 100MiB
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+}

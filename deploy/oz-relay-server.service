@@ -1,0 +1,34 @@
+[Unit]
+Description=OZ Relay Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oz-relay
+Group=oz-relay
+WorkingDirectory=/opt/oz-relay
+
+ExecStart=/opt/oz-relay/bin/oz-relay-server
+Restart=always
+RestartSec=5
+
+EnvironmentFile=/opt/oz-relay/config/config.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/oz-relay/logs /opt/arcflow/.relay-worktrees /opt/promotions
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=8G
+
+# Logging
+StandardOutput=append:/opt/oz-relay/logs/server.log
+StandardError=append:/opt/oz-relay/logs/server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,743 @@
+// Copyright (c) 2026 OZ Global Inc.
+// Licensed under the Apache License, Version 2.0.
+
+//! HTTP routes: A2A JSON-RPC endpoint, AgentCard, health check.
+//!
+//! Security fixes applied:
+//! - #3: Request body size limit (1MB) via DefaultBodyLimit
+//! - #5: Tenant isolation — task access filtered by JWT `sub` claim
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::middleware;
+use axum::response::{IntoResponse, Json, Response, Sse};
+use axum::routing::{get, post};
+use axum::Router;
+
+use oz_relay_common::a2a::*;
+use oz_relay_common::intent::Intent;
+use oz_relay_common::validation::validate_intent;
+
+use crate::auth::{auth_middleware, RelayClaims};
+use crate::AppState;
+
+/// Build the full router.
+pub fn build_router(state: Arc<AppState>) -> Router {
+    // Public routes (no auth)
+    let public = Router::new()
+        .route("/.well-known/agent.json", get(agent_card))
+        .route("/health", get(health));
+
+    // Authenticated routes
+    let authenticated = Router::new()
+        .route("/a2a", post(a2a_endpoint))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .merge(public)
+        .merge(authenticated)
+        // FIX #3: 1MB request body size limit to prevent OOM DoS
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+        .with_state(state)
+}
+
+/// GET /.well-known/agent.json
+async fn agent_card(State(state): State<Arc<AppState>>) -> Json<AgentCard> {
+    Json(AgentCard::arcflow_relay(&state.config.relay_url))
+}
+
+/// GET /health
+async fn health() -> &'static str {
+    "ok"
+}
+
+/// POST /a2a — JSON-RPC 2.0 dispatcher
+async fn a2a_endpoint(
+    State(state): State<Arc<AppState>>,
+    claims: Option<axum::Extension<RelayClaims>>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Response {
+    // Validate JSON-RPC version
+    if req.jsonrpc != "2.0" {
+        return Json(JsonRpcResponse::error(
+            req.id,
+            -32600,
+            "invalid JSON-RPC version",
+        ))
+        .into_response();
+    }
+
+    let claims = match claims {
+        Some(axum::Extension(c)) => c,
+        None => {
+            return Json(JsonRpcResponse::error(req.id, ERR_UNAUTHORIZED, "unauthorized"))
+                .into_response()
+        }
+    };
+
+    match req.method.as_str() {
+        "message/send" => handle_message_send(state, claims, req).await,
+        "message/stream" => handle_message_stream(state, claims, req).await,
+        "tasks/get" => handle_tasks_get(state, claims, req).await,
+        "tasks/cancel" => handle_tasks_cancel(state, claims, req).await,
+        _ => Json(JsonRpcResponse::error(
+            req.id,
+            -32601,
+            format!("method not found: {}", req.method),
+        ))
+        .into_response(),
+    }
+}
+
+/// message/send — submit an intent, create a task
+async fn handle_message_send(
+    state: Arc<AppState>,
+    claims: RelayClaims,
+    req: JsonRpcRequest,
+) -> Response {
+    // Rate limit check
+    if let Err(retry_after) = state.rate_limiter.check(&claims.sub, &claims.tier) {
+        return Json(JsonRpcResponse::error(
+            req.id,
+            ERR_RATE_LIMITED,
+            format!("rate limit exceeded, retry after {} seconds", retry_after),
+        ))
+        .into_response();
+    }
+
+    // Parse the message from params
+    let message: Message = match serde_json::from_value(req.params.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                -32602,
+                format!("invalid message: {}", e),
+            ))
+            .into_response()
+        }
+    };
+
+    // Validate the intent if present
+    if let Some(intent) = Intent::from_message(&message) {
+        let errors = validate_intent(&intent);
+        if !errors.is_empty() {
+            let error_msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+            return Json(JsonRpcResponse::error(
+                req.id,
+                ERR_INVALID_INTENT,
+                format!("intent validation failed: {}", error_msgs.join("; ")),
+            ))
+            .into_response();
+        }
+    }
+
+    // FIX #5: Create the task with owner from JWT claims
+    let task = state.task_manager.create_task(&claims.sub, message);
+
+    Json(JsonRpcResponse::success(
+        req.id,
+        serde_json::to_value(&task).unwrap(),
+    ))
+    .into_response()
+}
+
+/// message/stream — SSE stream of task progress
+async fn handle_message_stream(
+    state: Arc<AppState>,
+    claims: RelayClaims,
+    req: JsonRpcRequest,
+) -> Response {
+    let task_id: uuid::Uuid = match req.params.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => match id.parse() {
+            Ok(u) => u,
+            Err(_) => {
+                return Json(JsonRpcResponse::error(
+                    req.id,
+                    -32602,
+                    "invalid taskId format",
+                ))
+                .into_response()
+            }
+        },
+        None => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                -32602,
+                "missing taskId parameter",
+            ))
+            .into_response()
+        }
+    };
+
+    // FIX #5: Only return tasks owned by the requesting developer
+    let task = match state.task_manager.get_task_for_owner(task_id, &claims.sub) {
+        Some(t) => t,
+        None => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                ERR_TASK_NOT_FOUND,
+                "task not found",
+            ))
+            .into_response()
+        }
+    };
+
+    let event = axum::response::sse::Event::default()
+        .json_data(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": task,
+        }))
+        .unwrap();
+
+    let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(event));
+    Sse::new(stream).into_response()
+}
+
+/// tasks/get — retrieve a task by ID
+async fn handle_tasks_get(
+    state: Arc<AppState>,
+    claims: RelayClaims,
+    req: JsonRpcRequest,
+) -> Response {
+    let task_id: uuid::Uuid = match req.params.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => match id.parse() {
+            Ok(u) => u,
+            Err(_) => {
+                return Json(JsonRpcResponse::error(
+                    req.id,
+                    -32602,
+                    "invalid taskId format",
+                ))
+                .into_response()
+            }
+        },
+        None => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                -32602,
+                "missing taskId parameter",
+            ))
+            .into_response()
+        }
+    };
+
+    // FIX #5: Only return tasks owned by the requesting developer
+    match state.task_manager.get_task_for_owner(task_id, &claims.sub) {
+        Some(task) => Json(JsonRpcResponse::success(
+            req.id,
+            serde_json::to_value(&task).unwrap(),
+        ))
+        .into_response(),
+        None => Json(JsonRpcResponse::error(
+            req.id,
+            ERR_TASK_NOT_FOUND,
+            "task not found",
+        ))
+        .into_response(),
+    }
+}
+
+/// tasks/cancel — cancel a running task
+async fn handle_tasks_cancel(
+    state: Arc<AppState>,
+    claims: RelayClaims,
+    req: JsonRpcRequest,
+) -> Response {
+    let task_id: uuid::Uuid = match req.params.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => match id.parse() {
+            Ok(u) => u,
+            Err(_) => {
+                return Json(JsonRpcResponse::error(
+                    req.id,
+                    -32602,
+                    "invalid taskId format",
+                ))
+                .into_response()
+            }
+        },
+        None => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                -32602,
+                "missing taskId parameter",
+            ))
+            .into_response()
+        }
+    };
+
+    // FIX #5: Only allow canceling tasks owned by the requesting developer
+    match state
+        .task_manager
+        .transition_task_for_owner(task_id, &claims.sub, TaskState::Canceled)
+    {
+        Ok(task) => Json(JsonRpcResponse::success(
+            req.id,
+            serde_json::to_value(&task).unwrap(),
+        ))
+        .into_response(),
+        Err(e) => {
+            let code = if e.contains("not found") {
+                ERR_TASK_NOT_FOUND
+            } else {
+                ERR_TASK_NOT_CANCELABLE
+            };
+            Json(JsonRpcResponse::error(req.id, code, e)).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use axum::body::Body;
+    use axum::http::{self, Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        let config = ServerConfig::test();
+        Arc::new(AppState {
+            task_manager: crate::task_manager::TaskManager::new(),
+            rate_limiter: crate::rate_limit::RateLimiter::new(config.rate_limits.clone()),
+            config,
+        })
+    }
+
+    fn auth_header(secret: &str) -> String {
+        let token = RelayClaims::sign("dev_test", "community", secret);
+        format!("Bearer bsk_{}", token)
+    }
+
+    fn auth_header_for(sub: &str, secret: &str) -> String {
+        let token = RelayClaims::sign(sub, "community", secret);
+        format!("Bearer bsk_{}", token)
+    }
+
+    #[tokio::test]
+    async fn health_check() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_card_endpoint() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/agent.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let card: AgentCard = serde_json::from_slice(&body).unwrap();
+        assert_eq!(card.name, "oz-relay-arcflow");
+        assert!(card.capabilities.streaming);
+    }
+
+    #[tokio::test]
+    async fn a2a_requires_auth() {
+        let app = build_router(test_state());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {}
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn message_send_creates_task() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let intent = oz_relay_common::intent::Intent {
+            description: "Add trim() function".into(),
+            motivation: "Need to trim whitespace from strings".into(),
+            category: oz_relay_common::intent::IntentCategory::Feature,
+            test_cases: vec![oz_relay_common::intent::TestCase {
+                query: "RETURN trim('  hello  ')".into(),
+                expected_behavior: "Returns 'hello'".into(),
+                input_data: None,
+            }],
+            context: oz_relay_common::intent::IntentContext {
+                arcflow_version: "1.7.0".into(),
+                ..Default::default()
+            },
+        };
+        let message = intent.into_message();
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": message,
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rpc.error.is_none());
+        let task: Task = serde_json::from_value(rpc.result.unwrap()).unwrap();
+        assert_eq!(task.state, TaskState::Submitted);
+        assert_eq!(task.owner, "dev_test");
+        assert_eq!(task.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_intent_rejected() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let message = Message {
+            role: MessageRole::User,
+            parts: vec![Part::Data {
+                mime_type: oz_relay_common::intent::INTENT_MIME_TYPE.into(),
+                data: serde_json::json!({
+                    "description": "",
+                    "motivation": "test",
+                    "category": "feature",
+                    "test_cases": [{"query": "x", "expected_behavior": "y"}],
+                    "context": {"arcflow_version": "1.7.0"}
+                }),
+            }],
+        };
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "message/send",
+            "params": message,
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rpc.error.is_some());
+        assert_eq!(rpc.error.unwrap().code, ERR_INVALID_INTENT);
+    }
+
+    #[tokio::test]
+    async fn unknown_method_rejected() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "nonexistent/method",
+            "params": {}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rpc.error.is_some());
+        assert_eq!(rpc.error.unwrap().code, -32601);
+    }
+
+    #[tokio::test]
+    async fn tasks_get_returns_task() {
+        let state = test_state();
+        let msg = Message {
+            role: MessageRole::User,
+            parts: vec![Part::Text {
+                text: "test".into(),
+            }],
+        };
+        let task = state.task_manager.create_task("dev_test", msg);
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tasks/get",
+            "params": {"taskId": task.id.to_string()}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert!(rpc.error.is_none());
+        let fetched: Task = serde_json::from_value(rpc.result.unwrap()).unwrap();
+        assert_eq!(fetched.id, task.id);
+    }
+
+    #[tokio::test]
+    async fn tasks_get_not_found() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tasks/get",
+            "params": {"taskId": uuid::Uuid::new_v4().to_string()}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc.error.unwrap().code, ERR_TASK_NOT_FOUND);
+    }
+
+    // FIX #5: Tenant isolation test — developer B cannot see developer A's tasks
+    #[tokio::test]
+    async fn tenant_isolation_enforced() {
+        let state = test_state();
+        let secret = &ServerConfig::test().jwt_secret;
+
+        // Developer A creates a task
+        let msg = Message {
+            role: MessageRole::User,
+            parts: vec![Part::Text {
+                text: "test".into(),
+            }],
+        };
+        let task = state.task_manager.create_task("dev_alice", msg);
+
+        // Developer B tries to access it
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tasks/get",
+            "params": {"taskId": task.id.to_string()}
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header("authorization", auth_header_for("dev_bob", secret))
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc.error.unwrap().code, ERR_TASK_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_enforced() {
+        let state = test_state();
+
+        for i in 0..3 {
+            let app = build_router(state.clone());
+            let intent = oz_relay_common::intent::Intent {
+                description: format!("intent {}", i),
+                motivation: "test".into(),
+                category: oz_relay_common::intent::IntentCategory::Feature,
+                test_cases: vec![oz_relay_common::intent::TestCase {
+                    query: "MATCH (n) RETURN n".into(),
+                    expected_behavior: "returns nodes".into(),
+                    input_data: None,
+                }],
+                context: oz_relay_common::intent::IntentContext {
+                    arcflow_version: "1.7.0".into(),
+                    ..Default::default()
+                },
+            };
+
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": i,
+                "method": "message/send",
+                "params": intent.into_message(),
+            });
+
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(http::Method::POST)
+                        .uri("/a2a")
+                        .header("content-type", "application/json")
+                        .header(
+                            "authorization",
+                            auth_header(&ServerConfig::test().jwt_secret),
+                        )
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rpc: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
+            assert!(rpc.error.is_none(), "request {} should succeed", i);
+        }
+
+        // 4th request should be rate limited
+        let app = build_router(state.clone());
+        let intent = oz_relay_common::intent::Intent {
+            description: "one more".into(),
+            motivation: "test".into(),
+            category: oz_relay_common::intent::IntentCategory::Feature,
+            test_cases: vec![oz_relay_common::intent::TestCase {
+                query: "MATCH (n) RETURN n".into(),
+                expected_behavior: "returns nodes".into(),
+                input_data: None,
+            }],
+            context: oz_relay_common::intent::IntentContext {
+                arcflow_version: "1.7.0".into(),
+                ..Default::default()
+            },
+        };
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "message/send",
+            "params": intent.into_message(),
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/a2a")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(rpc.error.unwrap().code, ERR_RATE_LIMITED);
+    }
+}
