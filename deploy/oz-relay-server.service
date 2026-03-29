@@ -19,7 +19,7 @@ EnvironmentFile=/opt/oz-relay/config/config.env
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/oz-relay/logs /opt/arcflow/.relay-worktrees /opt/promotions
+ReadWritePaths=/opt/oz-relay/logs /opt/arcflow/.relay-worktrees /opt/promotions /opt/oz-relay/cargo-cache
 PrivateTmp=true
 
 # Resource limits
