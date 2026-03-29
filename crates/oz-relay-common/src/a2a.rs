@@ -66,7 +66,7 @@ impl AgentCard {
             },
             authentication: AuthenticationInfo {
                 schemes: vec!["bearer".into()],
-                credentials_url: Some("https://oz.global/relay/keys".into()),
+                credentials_url: Some("https://ozapi.net/relay/keys".into()),
             },
             documentation_url: Some(
                 "https://github.com/ozinc/oz-relay".into(),

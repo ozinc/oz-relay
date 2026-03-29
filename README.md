@@ -103,7 +103,7 @@ sudo systemctl enable --now oz-relay-server
 sudo systemctl enable --now caddy
 
 # Verify
-curl https://your-relay.example.com/.well-known/agent.json
+curl https://relay.ozapi.net/.well-known/agent.json
 
 # Generate a developer key
 ./generate-api-key.sh dev_alice community

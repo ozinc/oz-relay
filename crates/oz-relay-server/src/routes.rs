@@ -106,7 +106,7 @@ async fn handle_message_send(
             ERR_KEY_NOT_ACTIVE,
             format!(
                 "key status is '{}' — only active keys can submit intents. \
-                 apply for a Developer Relay Account at https://oz.global/relay/keys",
+                 apply for a Developer Relay Account at https://ozapi.net/relay/keys",
                 claims.status
             ),
         ))

@@ -57,5 +57,5 @@ jobs:
             sleep 2
             # FIX #13: Check both internal health and external TLS
             curl -sf http://localhost:3400/health || (journalctl -u oz-relay-server -n 20 && exit 1)
-            curl -sf https://relay.oz.global/health || echo "WARNING: external TLS health check failed"
+            curl -sf https://relay.ozapi.net/health || echo "WARNING: external TLS health check failed"
             echo "relay server deployed and healthy"

@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn agent_card_serializes() {
         use crate::a2a::AgentCard;
-        let card = AgentCard::arcflow_relay("https://relay.oz.global");
+        let card = AgentCard::arcflow_relay("https://relay.ozapi.net");
         let json = serde_json::to_string_pretty(&card).unwrap();
         assert!(json.contains("oz-relay-arcflow"));
         assert!(json.contains("bearer"));

@@ -1,7 +1,7 @@
 # OZ Relay — Caddy reverse proxy
 # Auto-provisions TLS via Let's Encrypt.
 
-relay.oz.global {
+relay.ozapi.net {
     reverse_proxy localhost:3400
 
     header {
