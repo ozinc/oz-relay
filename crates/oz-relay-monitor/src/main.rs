@@ -31,13 +31,18 @@ use ratatui::widgets::*;
 enum View {
     Dashboard,
     Ledger,
-    TaskList(String), // directory name: "failed", "submitted", "working", "completed"
+    EventDetail, // full-screen view of a single ledger event + associated task/bug
+    TaskList(String),
     Bugs,
 }
 
 struct App {
     view: View,
     scroll: u16,
+    /// Cursor position in the ledger list (for Enter-to-inspect).
+    cursor: usize,
+    /// Cached ledger lines (raw JSON) for inspection.
+    ledger_lines: Vec<String>,
     data_dir: PathBuf,
 }
 
@@ -55,6 +60,8 @@ fn main() -> io::Result<()> {
     let mut app = App {
         view: View::Dashboard,
         scroll: 0,
+        cursor: 0,
+        ledger_lines: Vec::new(),
         data_dir: PathBuf::from(data_dir),
     };
 
@@ -73,7 +80,12 @@ fn run_app(
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| draw(f, app))?;
+        // Pre-compute state that draw needs
+        if app.view == View::Ledger || app.view == View::EventDetail {
+            app.ledger_lines = load_ledger_lines(&app.data_dir);
+        }
+        let app_ref = &*app;
+        terminal.draw(|f| draw_view(f, app_ref))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -111,21 +123,55 @@ fn run_app(
                         app.view = View::Bugs;
                         app.scroll = 0;
                     }
+                    KeyCode::Enter => {
+                        if app.view == View::Ledger && !app.ledger_lines.is_empty() {
+                            app.view = View::EventDetail;
+                            app.scroll = 0;
+                        }
+                    }
                     KeyCode::Esc | KeyCode::Backspace => {
-                        app.view = View::Dashboard;
-                        app.scroll = 0;
+                        if app.view == View::EventDetail {
+                            app.view = View::Ledger;
+                            app.scroll = 0;
+                        } else {
+                            app.view = View::Dashboard;
+                            app.scroll = 0;
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        app.scroll = app.scroll.saturating_add(1);
+                        if app.view == View::Ledger {
+                            let max = app.ledger_lines.len().saturating_sub(1);
+                            app.cursor = (app.cursor + 1).min(max);
+                            // Auto-scroll to keep cursor visible
+                            let visible_height = 20u16; // approximate
+                            if app.cursor as u16 >= app.scroll + visible_height {
+                                app.scroll = (app.cursor as u16).saturating_sub(visible_height - 1);
+                            }
+                        } else {
+                            app.scroll = app.scroll.saturating_add(1);
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        app.scroll = app.scroll.saturating_sub(1);
+                        if app.view == View::Ledger {
+                            app.cursor = app.cursor.saturating_sub(1);
+                            if (app.cursor as u16) < app.scroll {
+                                app.scroll = app.cursor as u16;
+                            }
+                        } else {
+                            app.scroll = app.scroll.saturating_sub(1);
+                        }
                     }
                     KeyCode::PageDown => {
                         app.scroll = app.scroll.saturating_add(20);
+                        if app.view == View::Ledger {
+                            app.cursor = (app.cursor + 20).min(app.ledger_lines.len().saturating_sub(1));
+                        }
                     }
                     KeyCode::PageUp => {
                         app.scroll = app.scroll.saturating_sub(20);
+                        if app.view == View::Ledger {
+                            app.cursor = app.cursor.saturating_sub(20);
+                        }
                     }
                     _ => {}
                 }
@@ -137,10 +183,24 @@ fn run_app(
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn load_ledger_lines(data_dir: &Path) -> Vec<String> {
+    let path = data_dir.join("ledger/events.jsonl");
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn draw_view(f: &mut Frame, app: &App) {
     match &app.view {
         View::Dashboard => draw_dashboard(f, app),
         View::Ledger => draw_ledger(f, app),
+        View::EventDetail => draw_event_detail(f, app),
         View::TaskList(dir) => draw_task_list(f, app, dir),
         View::Bugs => draw_bugs(f, app),
     }
@@ -559,102 +619,282 @@ fn draw_dashboard(f: &mut Frame, app: &App) {
 // Ledger view — scrollable full event log
 // ---------------------------------------------------------------------------
 
+fn format_event_line(val: &serde_json::Value, owner_map: &std::collections::HashMap<String, String>) -> (String, Style) {
+    let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+    let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    let owner = val.get("owner").and_then(|v| v.as_str())
+        .or_else(|| owner_map.get(tid).map(|s| s.as_str()))
+        .unwrap_or("");
+
+    let mut fields = Vec::new();
+    if !owner.is_empty() {
+        fields.push(format!("owner={}", owner));
+    }
+    if let Some(m) = val.as_object() {
+        for (k, v) in m.iter() {
+            if matches!(k.as_str(), "ts" | "event" | "owner") { continue; }
+            fields.push(format!("{}={}", k, v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())));
+        }
+    }
+
+    let style = if event.contains("completed") || event.contains("approved") {
+        Style::default().fg(Color::Green)
+    } else if event.contains("failed") || event.contains("rejected") {
+        Style::default().fg(Color::Red)
+    } else if event.contains("bug") {
+        Style::default().fg(Color::Yellow)
+    } else if event.contains("duplicate") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    let text = format!("{}  {:25}  {}", &ts[..ts.len().min(19)], event, fields.join("  "));
+    (text, style)
+}
+
+fn build_owner_map(lines: &[String]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in lines {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let (Some(tid), Some(owner)) = (
+                val.get("task_id").and_then(|v| v.as_str()),
+                val.get("owner").and_then(|v| v.as_str()),
+            ) {
+                if !owner.is_empty() {
+                    map.insert(tid.to_string(), owner.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
 fn draw_ledger(f: &mut Frame, app: &App) {
     let area = f.area();
     let layout = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
         Constraint::Length(3),
-    ])
-    .split(area);
+    ]).split(area);
 
+    let count = app.ledger_lines.len();
     let header = Block::default()
         .borders(Borders::ALL)
-        .title(" Ledger — events.jsonl (newest first) ")
+        .title(format!(" Ledger — {} events (newest first) — ↑↓ navigate, Enter to inspect ", count))
         .title_alignment(Alignment::Center);
     f.render_widget(header, layout[0]);
 
-    let ledger_path = app.data_dir.join("ledger/events.jsonl");
+    let owner_map = build_owner_map(&app.ledger_lines);
+
+    let lines: Vec<Line> = app.ledger_lines.iter().enumerate().map(|(i, raw)| {
+        let is_selected = i == app.cursor;
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+            let (text, mut style) = format_event_line(&val, &owner_map);
+            if is_selected {
+                style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+            }
+            Line::from(Span::styled(format!("  {}", text), style))
+        } else {
+            let style = if is_selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!("  {}", raw), style))
+        }
+    }).collect();
+
+    let para = Paragraph::new(lines)
+        .scroll((app.scroll, 0))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, layout[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::raw("  ↑↓ select   "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" inspect   "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" back   "),
+        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit"),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, layout[2]);
+}
+
+// ---------------------------------------------------------------------------
+// Event detail view — full-screen inspection of a single event
+// ---------------------------------------------------------------------------
+
+fn draw_event_detail(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ]).split(area);
+
+    let header = Block::default()
+        .borders(Borders::ALL)
+        .title(" Event Detail ")
+        .title_alignment(Alignment::Center);
+    f.render_widget(header, layout[0]);
+
     let mut lines = Vec::new();
 
-    // Build owner map first
-    let mut owner_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(&ledger_path) {
-        for line in content.lines() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if let (Some(tid), Some(owner)) = (
-                    val.get("task_id").and_then(|v| v.as_str()),
-                    val.get("owner").and_then(|v| v.as_str()),
-                ) {
-                    if !owner.is_empty() {
-                        owner_map.insert(tid.to_string(), owner.to_string());
-                    }
+    if let Some(raw) = app.ledger_lines.get(app.cursor) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+            let owner_map = build_owner_map(&app.ledger_lines);
+
+            // Event header
+            let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("?");
+            let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+            lines.push(Line::from(Span::styled(
+                format!("  Event:     {}", event),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!("  Timestamp: {}", ts)));
+            lines.push(Line::from(""));
+
+            // All fields
+            lines.push(Line::from(Span::styled("  Fields:", Style::default().add_modifier(Modifier::BOLD))));
+            if let Some(obj) = val.as_object() {
+                for (k, v) in obj {
+                    if k == "ts" || k == "event" { continue; }
+                    let val_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+                    });
+                    lines.push(Line::from(format!("    {}: {}", k, val_str)));
                 }
             }
-        }
 
-        for line in content.lines().rev() {
-            if line.trim().is_empty() {
-                continue;
+            // Resolve owner
+            let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let owner = val.get("owner").and_then(|v| v.as_str())
+                .or_else(|| owner_map.get(tid).map(|s| s.as_str()));
+            if let Some(o) = owner {
+                if !val.as_object().map_or(false, |m| m.contains_key("owner")) {
+                    lines.push(Line::from(format!("    owner: {} (resolved)", o)));
+                }
             }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-                let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
 
-                // Resolve owner from event or map
-                let owner = val.get("owner").and_then(|v| v.as_str())
-                    .or_else(|| owner_map.get(tid).map(|s| s.as_str()))
-                    .unwrap_or("");
+            // If this event has a task_id, try to load the full task file
+            if !tid.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("  Associated Task:", Style::default().add_modifier(Modifier::BOLD))));
 
-                // Collect all fields except ts/event for display
-                let fields: Vec<String> = val
-                    .as_object()
-                    .map(|m| {
-                        let mut items: Vec<String> = Vec::new();
-                        // Show owner first if resolved
-                        if !owner.is_empty() && !m.contains_key("owner") {
-                            items.push(format!("owner={}", owner));
-                        }
-                        for (k, v) in m.iter() {
-                            if *k == "ts" || *k == "event" {
-                                continue;
+                let mut found = false;
+                for dir in &["submitted", "working", "completed", "failed", "canceled"] {
+                    let path = app.data_dir.join("tasks").join(dir).join(format!("{}.json", tid));
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        found = true;
+                        lines.push(Line::from(format!("    Location: tasks/{}/", dir)));
+
+                        if let Ok(task) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let state = task.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                            let owner = task.get("owner").and_then(|v| v.as_str()).unwrap_or("?");
+                            lines.push(Line::from(format!("    State:    {}", state)));
+                            lines.push(Line::from(format!("    Owner:    {}", owner)));
+
+                            // Show intent description
+                            if let Some(desc) = task.get("messages")
+                                .and_then(|m| m.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|m| m.get("parts"))
+                                .and_then(|p| p.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|p| p.get("data"))
+                                .and_then(|d| d.get("description"))
+                                .and_then(|d| d.as_str())
+                            {
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::styled("  Intent:", Style::default().add_modifier(Modifier::BOLD))));
+                                // Word-wrap the description
+                                for chunk in desc.as_bytes().chunks(80) {
+                                    if let Ok(s) = std::str::from_utf8(chunk) {
+                                        lines.push(Line::from(format!("    {}", s)));
+                                    }
+                                }
                             }
-                            items.push(format!(
-                                "{}={}",
-                                k,
-                                v.as_str()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| v.to_string())
-                            ));
+
+                            // Show agent response if present
+                            if let Some(msgs) = task.get("messages").and_then(|m| m.as_array()) {
+                                for msg in msgs {
+                                    if msg.get("role").and_then(|r| r.as_str()) == Some("agent") {
+                                        lines.push(Line::from(""));
+                                        lines.push(Line::from(Span::styled("  Agent Response:", Style::default().add_modifier(Modifier::BOLD))));
+                                        if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                                            for part in parts {
+                                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                    for chunk in text.as_bytes().chunks(80) {
+                                                        if let Ok(s) = std::str::from_utf8(chunk) {
+                                                            lines.push(Line::from(format!("    {}", s)));
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(data) = part.get("data") {
+                                                    let pretty = serde_json::to_string_pretty(data).unwrap_or_default();
+                                                    for pline in pretty.lines() {
+                                                        lines.push(Line::from(format!("    {}", pline)));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        items
-                    })
-                    .unwrap_or_default();
+                        break;
+                    }
+                }
+                if !found {
+                    lines.push(Line::from(Span::styled("    (task file not found on disk)", Style::default().fg(Color::DarkGray))));
+                }
+            }
 
-                let style = if event.contains("completed") || event.contains("approved") {
-                    Style::default().fg(Color::Green)
-                } else if event.contains("failed") || event.contains("rejected") {
-                    Style::default().fg(Color::Red)
-                } else if event.contains("bug") {
-                    Style::default().fg(Color::Yellow)
-                } else if event.contains("duplicate") {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
+            // If this event has a bug_id, try to load the bug file
+            let bug_id = val.get("bug_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !bug_id.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("  Associated Bug:", Style::default().add_modifier(Modifier::BOLD))));
 
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}  {:25}  {}",
-                        &ts[..ts.len().min(19)],
-                        event,
-                        fields.join("  ")
-                    ),
-                    style,
-                )));
-            } else {
-                lines.push(Line::from(format!("  {}", line)));
+                let mut found = false;
+                for dir in &["incoming", "triaged", "resolved"] {
+                    let path = app.data_dir.join("bugs").join(dir).join(format!("{}.json", bug_id));
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        found = true;
+                        lines.push(Line::from(format!("    Location: bugs/{}/", dir)));
+
+                        if let Ok(bug) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(err) = bug.get("report").and_then(|r| r.get("errorMessage")).and_then(|e| e.as_str()) {
+                                lines.push(Line::from(format!("    Error: {}", err)));
+                            }
+                            if let Some(q) = bug.get("report").and_then(|r| r.get("query")).and_then(|q| q.as_str()) {
+                                lines.push(Line::from(format!("    Query: {}", q)));
+                            }
+                            if let Some(occ) = bug.get("occurrences").and_then(|o| o.as_u64()) {
+                                lines.push(Line::from(format!("    Occurrences: {}", occ)));
+                            }
+                            if let Some(ver) = bug.get("report").and_then(|r| r.get("arcflowVersion")).and_then(|v| v.as_str()) {
+                                lines.push(Line::from(format!("    Version: {}", ver)));
+                            }
+                        }
+                        break;
+                    }
+                }
+                if !found {
+                    lines.push(Line::from(Span::styled("    (bug file not found on disk)", Style::default().fg(Color::DarkGray))));
+                }
+            }
+
+            // Raw JSON at the bottom
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Raw JSON:", Style::default().fg(Color::DarkGray))));
+            let pretty = serde_json::to_string_pretty(&val).unwrap_or_default();
+            for pline in pretty.lines() {
+                lines.push(Line::from(Span::styled(format!("    {}", pline), Style::default().fg(Color::DarkGray))));
             }
         }
     }
@@ -667,7 +907,7 @@ fn draw_ledger(f: &mut Frame, app: &App) {
     let footer = Paragraph::new(Line::from(vec![
         Span::raw("  ↑↓ scroll   "),
         Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" back   "),
+        Span::raw(" back to ledger   "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ]))
