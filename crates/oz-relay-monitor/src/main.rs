@@ -243,7 +243,25 @@ fn scan_dashboard(data_dir: &Path) -> DashboardState {
     let mut daily_builds = 0usize;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
+    // Build owner map: task_id → developer name
+    let mut owner_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
     if let Ok(content) = std::fs::read_to_string(&ledger) {
+        // First pass: build owner map
+        for line in content.lines() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(tid), Some(owner)) = (
+                    val.get("task_id").and_then(|v| v.as_str()),
+                    val.get("owner").and_then(|v| v.as_str()),
+                ) {
+                    if !owner.is_empty() {
+                        owner_map.insert(tid.to_string(), owner.to_string());
+                    }
+                }
+            }
+        }
+
+        // Second pass: build event lines with resolved owners
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -253,19 +271,53 @@ fn scan_dashboard(data_dir: &Path) -> DashboardState {
                 let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
                 let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
                 let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                let owner = val.get("owner").and_then(|v| v.as_str()).unwrap_or("");
-                let short = &tid[..tid.len().min(8)];
-                let extra = if !owner.is_empty() {
-                    format!("  {}", owner)
+                let bug_id = val.get("bug_id").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Resolve owner: from event itself, or from owner_map by task_id
+                let owner = val.get("owner").and_then(|v| v.as_str())
+                    .or_else(|| owner_map.get(tid).map(|s| s.as_str()))
+                    .unwrap_or("");
+
+                // Pick the right ID to show
+                let id_str = if !tid.is_empty() {
+                    &tid[..tid.len().min(8)]
+                } else if !bug_id.is_empty() {
+                    bug_id
+                } else {
+                    ""
+                };
+
+                // Build extra context based on event type
+                let context = if !owner.is_empty() {
+                    owner.to_string()
+                } else if let Some(fp) = val.get("fingerprint").and_then(|v| v.as_str()) {
+                    format!("fp:{}", &fp[..fp.len().min(8)])
+                } else if let Some(ver) = val.get("arcflow_version").and_then(|v| v.as_str()) {
+                    format!("v{}", ver)
                 } else {
                     String::new()
                 };
+
+                // Add cost info for build events
+                let cost_str = val.get("cost_usd")
+                    .and_then(|v| v.as_str())
+                    .map(|c| format!(" ${}", c))
+                    .unwrap_or_default();
+
+                // Add occurrences for bug duplicates
+                let occ_str = val.get("occurrences")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| format!(" (x{})", n))
+                    .unwrap_or_default();
+
                 recent.push(format!(
-                    "{}  {:25}  {}{}",
+                    "{}  {:25}  {:10}  {}{}{}",
                     &ts[..ts.len().min(19)],
                     event,
-                    short,
-                    extra
+                    id_str,
+                    context,
+                    cost_str,
+                    occ_str,
                 ));
 
                 if ts.starts_with(&today) && event.starts_with("build.") {
@@ -524,7 +576,23 @@ fn draw_ledger(f: &mut Frame, app: &App) {
 
     let ledger_path = app.data_dir.join("ledger/events.jsonl");
     let mut lines = Vec::new();
+
+    // Build owner map first
+    let mut owner_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Ok(content) = std::fs::read_to_string(&ledger_path) {
+        for line in content.lines() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(tid), Some(owner)) = (
+                    val.get("task_id").and_then(|v| v.as_str()),
+                    val.get("owner").and_then(|v| v.as_str()),
+                ) {
+                    if !owner.is_empty() {
+                        owner_map.insert(tid.to_string(), owner.to_string());
+                    }
+                }
+            }
+        }
+
         for line in content.lines().rev() {
             if line.trim().is_empty() {
                 continue;
@@ -532,21 +600,35 @@ fn draw_ledger(f: &mut Frame, app: &App) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
                 let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let rest: Vec<String> = val
+                let tid = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Resolve owner from event or map
+                let owner = val.get("owner").and_then(|v| v.as_str())
+                    .or_else(|| owner_map.get(tid).map(|s| s.as_str()))
+                    .unwrap_or("");
+
+                // Collect all fields except ts/event for display
+                let fields: Vec<String> = val
                     .as_object()
                     .map(|m| {
-                        m.iter()
-                            .filter(|(k, _)| *k != "ts" && *k != "event")
-                            .map(|(k, v)| {
-                                format!(
-                                    "{}={}",
-                                    k,
-                                    v.as_str()
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| v.to_string())
-                                )
-                            })
-                            .collect()
+                        let mut items: Vec<String> = Vec::new();
+                        // Show owner first if resolved
+                        if !owner.is_empty() && !m.contains_key("owner") {
+                            items.push(format!("owner={}", owner));
+                        }
+                        for (k, v) in m.iter() {
+                            if *k == "ts" || *k == "event" {
+                                continue;
+                            }
+                            items.push(format!(
+                                "{}={}",
+                                k,
+                                v.as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| v.to_string())
+                            ));
+                        }
+                        items
                     })
                     .unwrap_or_default();
 
@@ -556,6 +638,8 @@ fn draw_ledger(f: &mut Frame, app: &App) {
                     Style::default().fg(Color::Red)
                 } else if event.contains("bug") {
                     Style::default().fg(Color::Yellow)
+                } else if event.contains("duplicate") {
+                    Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default()
                 };
@@ -565,7 +649,7 @@ fn draw_ledger(f: &mut Frame, app: &App) {
                         "  {}  {:25}  {}",
                         &ts[..ts.len().min(19)],
                         event,
-                        rest.join("  ")
+                        fields.join("  ")
                     ),
                     style,
                 )));
