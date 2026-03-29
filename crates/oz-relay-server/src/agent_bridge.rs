@@ -213,6 +213,76 @@ pub async fn run_cargo_test(worktree_path: &Path, timeout: Duration) -> SandboxR
     run_sandboxed("cargo", &["test"], worktree_path, timeout).await
 }
 
+/// Token usage parsed from claude output.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Parse token usage from claude's stderr/stdout.
+/// Claude Code --print reports usage like: "Total tokens: 142,000" or in JSON stats.
+pub fn parse_token_usage(stdout: &str, stderr: &str) -> TokenUsage {
+    let combined = format!("{}\n{}", stdout, stderr);
+    let mut usage = TokenUsage::default();
+
+    for line in combined.lines() {
+        let line = line.trim().to_lowercase();
+        // Look for token counts in various formats
+        if line.contains("input") && line.contains("token") {
+            if let Some(n) = extract_number(&line) {
+                usage.input_tokens = n;
+            }
+        } else if line.contains("output") && line.contains("token") {
+            if let Some(n) = extract_number(&line) {
+                usage.output_tokens = n;
+            }
+        } else if line.contains("total") && line.contains("token") {
+            if let Some(n) = extract_number(&line) {
+                usage.total_tokens = n;
+            }
+        } else if line.contains("cost") && line.contains("$") {
+            if let Some(cost) = extract_cost(&line) {
+                usage.cost_usd = cost;
+            }
+        }
+    }
+
+    // Estimate if we have individual counts but no total
+    if usage.total_tokens == 0 && (usage.input_tokens > 0 || usage.output_tokens > 0) {
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
+    }
+
+    // Estimate cost if not reported (Sonnet pricing: ~$3/1M input, ~$15/1M output)
+    if usage.cost_usd == 0.0 && usage.total_tokens > 0 {
+        usage.cost_usd = (usage.input_tokens as f64 * 3.0 / 1_000_000.0)
+            + (usage.output_tokens as f64 * 15.0 / 1_000_000.0);
+    }
+
+    usage
+}
+
+fn extract_number(s: &str) -> Option<u64> {
+    // Extract first number from string, handling commas
+    let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == ',').collect();
+    cleaned.replace(',', "").parse().ok()
+}
+
+fn extract_cost(s: &str) -> Option<f64> {
+    // Extract dollar amount like "$4.26" or "4.26"
+    for part in s.split_whitespace() {
+        let cleaned = part.trim_start_matches('$').trim_end_matches(',');
+        if let Ok(cost) = cleaned.parse::<f64>() {
+            if cost > 0.0 && cost < 1000.0 {
+                return Some(cost);
+            }
+        }
+    }
+    None
+}
+
 /// Parse cargo test output to extract pass/fail counts.
 /// Only extracts numbers — no test names, paths, or details.
 pub fn parse_test_results(output: &str) -> (u32, u32) {

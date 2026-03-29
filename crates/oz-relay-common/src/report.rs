@@ -34,6 +34,9 @@ pub struct BuildReport {
     pub summary: String,
     /// Test results.
     pub tests: TestReport,
+    /// Cost and token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<CostReport>,
     /// Artifact info (only present on success).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactReport>,
@@ -45,6 +48,21 @@ pub struct TestReport {
     pub total: u32,
     pub passed: u32,
     pub failed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostReport {
+    /// Total tokens used by the claude session.
+    pub total_tokens: u64,
+    /// Input tokens.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Estimated cost in USD.
+    pub cost_usd: f64,
+    /// Build elapsed time in seconds.
+    pub elapsed_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -390,6 +390,8 @@ async fn handle_message_send(
             .await;
 
             let claude_elapsed = start.elapsed();
+            let token_usage = agent_bridge::parse_token_usage(&agent_result.stdout, &agent_result.stderr);
+
             tracing::info!(
                 task_id = %task_id,
                 exit_code = agent_result.exit_code,
@@ -397,6 +399,8 @@ async fn handle_message_send(
                 stdout_len = agent_result.stdout.len(),
                 stderr_len = agent_result.stderr.len(),
                 elapsed_secs = claude_elapsed.as_secs(),
+                total_tokens = token_usage.total_tokens,
+                cost_usd = token_usage.cost_usd,
                 "claude session finished"
             );
 
@@ -441,6 +445,7 @@ async fn handle_message_send(
             let success = test_result.exit_code == 0 && failed == 0 && !agent_result.timed_out;
 
             // Build the structured report
+            let total_elapsed = start.elapsed();
             let build_report = report::BuildReport {
                 branch: branch_name.clone(),
                 success,
@@ -450,6 +455,13 @@ async fn handle_message_send(
                     passed,
                     failed,
                 },
+                cost: Some(report::CostReport {
+                    total_tokens: token_usage.total_tokens,
+                    input_tokens: token_usage.input_tokens,
+                    output_tokens: token_usage.output_tokens,
+                    cost_usd: token_usage.cost_usd,
+                    elapsed_secs: total_elapsed.as_secs(),
+                }),
                 artifact: None, // TODO: compile and sign artifact
             };
 
@@ -477,6 +489,9 @@ async fn handle_message_send(
                     "description": intent_desc,
                     "tests_passed": passed,
                     "tests_failed": failed,
+                    "total_tokens": token_usage.total_tokens,
+                    "cost_usd": token_usage.cost_usd,
+                    "elapsed_secs": total_elapsed.as_secs(),
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
                 let promotions_path = std::path::Path::new("/opt/promotions/pending");
@@ -505,12 +520,26 @@ async fn handle_message_send(
                 let _ = sandbox::remove_worktree(&source_repo, &worktree).await;
             }
 
-            let total_elapsed = start.elapsed();
+            // Log to ledger
+            task_manager.task_manager.log_event(serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "event": format!("build.{}", final_state),
+                "task_id": task_id.to_string(),
+                "branch": branch_name,
+                "tests_passed": passed,
+                "tests_failed": failed,
+                "total_tokens": token_usage.total_tokens,
+                "cost_usd": format!("{:.2}", token_usage.cost_usd),
+                "elapsed_secs": total_elapsed.as_secs(),
+            })).await;
+
             tracing::info!(
                 task_id = %task_id,
                 final_state = final_state,
                 tests_passed = passed,
                 tests_failed = failed,
+                total_tokens = token_usage.total_tokens,
+                cost_usd = token_usage.cost_usd,
                 total_secs = total_elapsed.as_secs(),
                 "build pipeline complete"
             );
