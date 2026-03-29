@@ -37,22 +37,23 @@ The developer gets a working binary. The source never leaves the server.
 ## Architecture
 
 ```
-Developer's Agent                          OZ Relay Server
-      │                                         │
-      │  ── capability discovery ──────────────► │  /.well-known/agent.json
-      │  ◄── AgentCard ─────────────────────────  │
-      │                                         │
-      │  ── message/send (Intent) ─────────────► │  /a2a (JSON-RPC 2.0)
-      │                                         │  ┌─────────────────────┐
-      │                                         │  │ nsjail sandbox      │
-      │  ◄── SSE progress ──────────────────────  │  │  └─ Claude Code    │
-      │      "implementing feature..."          │  │     └─ cargo test   │
-      │      "847 tests pass, 0 fail..."        │  │     └─ cargo build  │
-      │                                         │  └─────────────────────┘
-      │  ◄── Artifact (signed .so/.dylib) ──────  │
-      │      + manifest (sha256, Ed25519 sig)   │
-      │      + behavioral summary               │
-      │                                         │
+Developer's Agent                           OZ Relay Server
+       │                                          │
+       │  ── capability discovery ──────────────►  │  /.well-known/agent.json
+       │  ◄── AgentCard ────────────────────────  │
+       │                                          │
+       │  ── message/send (Intent) ────────────►  │  /a2a (JSON-RPC 2.0)
+       │                                          │
+       │                                          │  ┌──────────────────────┐
+       │  ◄── SSE progress ────────────────────  │  │  nsjail sandbox      │
+       │      "implementing feature..."           │  │   └─ Claude Code     │
+       │      "847 tests pass, 0 fail..."         │  │      └─ cargo test   │
+       │                                          │  │      └─ cargo build  │
+       │                                          │  └──────────────────────┘
+       │  ◄── Artifact (signed .so/.dylib) ────  │
+       │      + manifest (sha256, Ed25519 sig)    │
+       │      + behavioral summary                │
+       │                                          │
 ```
 
 **A2A** connects agents to each other. **MCP** connects agents to tools. **OIP** (Open Intent Protocol) defines the intent schema, source-privacy boundary, and artifact signing format on top of A2A.
