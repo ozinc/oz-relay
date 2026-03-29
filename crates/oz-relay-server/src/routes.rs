@@ -42,6 +42,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let authenticated = Router::new()
         .route("/a2a", post(a2a_endpoint))
         .route("/bugs/triage", post(handle_bug_triage))
+        .route("/promotions/list", post(handle_promotions_list))
+        .route("/promotions/approve", post(handle_promotions_approve))
+        .route("/promotions/reject", post(handle_promotions_reject))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -254,6 +257,162 @@ fn fnv_hash(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// POST /promotions/list — list pending promotions
+async fn handle_promotions_list(
+    State(state): State<Arc<AppState>>,
+    _claims: Option<axum::Extension<RelayClaims>>,
+) -> Response {
+    let pending_dir = state.config.data_dir.join("promotions/pending");
+
+    let mut entries = match tokio::fs::read_dir(&pending_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to read promotions/pending");
+            return Json(serde_json::json!({ "promotions": [] })).into_response();
+        }
+    };
+
+    let mut promotions = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    promotions.push(val);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Json(serde_json::json!({ "promotions": promotions })).into_response()
+}
+
+/// POST /promotions/approve — move a promotion from pending to approved
+async fn handle_promotions_approve(
+    State(state): State<Arc<AppState>>,
+    _claims: Option<axum::Extension<RelayClaims>>,
+    Json(params): Json<serde_json::Value>,
+) -> Response {
+    let task_id = match params.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => {
+            return Json(serde_json::json!({ "error": "missing taskId parameter" }))
+                .into_response();
+        }
+    };
+
+    let pending_file = state
+        .config
+        .data_dir
+        .join(format!("promotions/pending/{}.json", task_id));
+    let approved_file = state
+        .config
+        .data_dir
+        .join(format!("promotions/approved/{}.json", task_id));
+
+    if !tokio::fs::try_exists(&pending_file).await.unwrap_or(false) {
+        return Json(serde_json::json!({ "error": "promotion not found" })).into_response();
+    }
+
+    // Read, write to approved, then remove from pending (crash-safe order)
+    let content = match tokio::fs::read_to_string(&pending_file).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to read pending promotion");
+            return Json(serde_json::json!({ "error": "internal error" })).into_response();
+        }
+    };
+
+    if let Err(e) = tokio::fs::write(&approved_file, &content).await {
+        tracing::error!(error = %e, "failed to write approved promotion");
+        return Json(serde_json::json!({ "error": "internal error" })).into_response();
+    }
+    let _ = tokio::fs::remove_file(&pending_file).await;
+
+    state
+        .task_manager
+        .log_event(serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "event": "promotion.approved",
+            "task_id": task_id,
+        }))
+        .await;
+
+    tracing::info!(task_id = %task_id, "promotion approved");
+    Json(serde_json::json!({ "status": "approved", "taskId": task_id })).into_response()
+}
+
+/// POST /promotions/reject — move a promotion from pending to rejected with reason
+async fn handle_promotions_reject(
+    State(state): State<Arc<AppState>>,
+    _claims: Option<axum::Extension<RelayClaims>>,
+    Json(params): Json<serde_json::Value>,
+) -> Response {
+    let task_id = match params.get("taskId").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => {
+            return Json(serde_json::json!({ "error": "missing taskId parameter" }))
+                .into_response();
+        }
+    };
+
+    let reason = params
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no reason provided");
+
+    let pending_file = state
+        .config
+        .data_dir
+        .join(format!("promotions/pending/{}.json", task_id));
+    let rejected_file = state
+        .config
+        .data_dir
+        .join(format!("promotions/rejected/{}.json", task_id));
+
+    if !tokio::fs::try_exists(&pending_file).await.unwrap_or(false) {
+        return Json(serde_json::json!({ "error": "promotion not found" })).into_response();
+    }
+
+    // Read original, augment with rejection reason
+    let content = match tokio::fs::read_to_string(&pending_file).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to read pending promotion");
+            return Json(serde_json::json!({ "error": "internal error" })).into_response();
+        }
+    };
+
+    let mut val: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+    val["rejection_reason"] = serde_json::json!(reason);
+    val["rejected_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+
+    if let Err(e) = tokio::fs::write(&rejected_file, val.to_string()).await {
+        tracing::error!(error = %e, "failed to write rejected promotion");
+        return Json(serde_json::json!({ "error": "internal error" })).into_response();
+    }
+    let _ = tokio::fs::remove_file(&pending_file).await;
+
+    state
+        .task_manager
+        .log_event(serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "event": "promotion.rejected",
+            "task_id": task_id,
+            "reason": reason,
+        }))
+        .await;
+
+    tracing::info!(task_id = %task_id, reason = %reason, "promotion rejected");
+    Json(serde_json::json!({ "status": "rejected", "taskId": task_id, "reason": reason }))
+        .into_response()
 }
 
 /// POST /a2a — JSON-RPC 2.0 dispatcher
@@ -706,14 +865,39 @@ async fn handle_message_stream(
         }
     };
 
-    let event = axum::response::sse::Event::default()
-        .json_data(serde_json::json!({
-            "jsonrpc": "2.0",
-            "result": task,
-        }))
-        .unwrap();
+    // Stream progress updates every 5 seconds until terminal state
+    let task_mgr = state.clone();
+    let owner = claims.sub.clone();
 
-    let stream = tokio_stream::once(Ok::<_, std::convert::Infallible>(event));
+    let stream = async_stream::stream! {
+        loop {
+            let current = task_mgr.task_manager.get_task_for_owner(task_id, &owner).await;
+            match current {
+                Some(t) => {
+                    let is_terminal = t.state.is_terminal();
+                    let event = axum::response::sse::Event::default()
+                        .json_data(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "result": {
+                                "state": t.state,
+                                "messages": t.messages.len(),
+                                "updatedAt": t.updated_at,
+                                "task": t,
+                            }
+                        }))
+                        .unwrap();
+                    yield Ok::<_, std::convert::Infallible>(event);
+
+                    if is_terminal {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                None => break,
+            }
+        }
+    };
+
     Sse::new(stream).into_response()
 }
 
@@ -1393,5 +1577,293 @@ mod tests {
 
         // Suspended keys get 403 at the middleware level
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn test_state_isolated() -> Arc<AppState> {
+        let mut config = ServerConfig::test();
+        config.data_dir = std::env::temp_dir().join(format!(
+            "oz-relay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Arc::new(AppState {
+            task_manager: crate::task_manager::TaskManager::new(),
+            rate_limiter: crate::rate_limit::RateLimiter::new(config.rate_limits.clone()),
+            config,
+        })
+    }
+
+    /// Helper: create promotions directories and seed a pending promotion file.
+    async fn seed_promotion(state: &Arc<AppState>, task_id: &str) {
+        let promo_dir = state.config.data_dir.join("promotions");
+        for sub in &["pending", "approved", "merged", "rejected"] {
+            tokio::fs::create_dir_all(promo_dir.join(sub))
+                .await
+                .unwrap();
+        }
+        let metadata = serde_json::json!({
+            "task_id": task_id,
+            "branch": format!("relay/dev_test-{}", task_id),
+            "developer": "dev_test",
+            "description": "Add trim() function",
+            "tests_passed": 5,
+            "tests_failed": 0,
+            "timestamp": "2026-03-29T00:00:00Z",
+        });
+        let file = promo_dir.join(format!("pending/{}.json", task_id));
+        tokio::fs::write(&file, serde_json::to_string_pretty(&metadata).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn promotions_list_returns_pending() {
+        let state = test_state_isolated();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        seed_promotion(&state, &task_id).await;
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/list")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let promotions = val["promotions"].as_array().unwrap();
+        assert_eq!(promotions.len(), 1);
+        assert_eq!(promotions[0]["task_id"].as_str().unwrap(), task_id);
+    }
+
+    #[tokio::test]
+    async fn promotions_list_empty_when_no_pending() {
+        let state = test_state_isolated();
+        // Create the directories but don't seed any files
+        let promo_dir = state.config.data_dir.join("promotions/pending");
+        tokio::fs::create_dir_all(&promo_dir).await.unwrap();
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/list")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["promotions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn promotions_approve_moves_file() {
+        let state = test_state_isolated();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        seed_promotion(&state, &task_id).await;
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({ "taskId": task_id });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/approve")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["status"].as_str().unwrap(), "approved");
+
+        // Verify file moved
+        let pending = state
+            .config
+            .data_dir
+            .join(format!("promotions/pending/{}.json", task_id));
+        let approved = state
+            .config
+            .data_dir
+            .join(format!("promotions/approved/{}.json", task_id));
+        assert!(!pending.exists());
+        assert!(approved.exists());
+    }
+
+    #[tokio::test]
+    async fn promotions_approve_not_found() {
+        let state = test_state_isolated();
+        let promo_dir = state.config.data_dir.join("promotions/pending");
+        tokio::fs::create_dir_all(&promo_dir).await.unwrap();
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({ "taskId": "nonexistent-id" });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/approve")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(val["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn promotions_reject_moves_file_with_reason() {
+        let state = test_state_isolated();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        seed_promotion(&state, &task_id).await;
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "taskId": task_id,
+            "reason": "tests are insufficient"
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/reject")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(val["status"].as_str().unwrap(), "rejected");
+        assert_eq!(val["reason"].as_str().unwrap(), "tests are insufficient");
+
+        // Verify file moved and contains rejection reason
+        let pending = state
+            .config
+            .data_dir
+            .join(format!("promotions/pending/{}.json", task_id));
+        let rejected = state
+            .config
+            .data_dir
+            .join(format!("promotions/rejected/{}.json", task_id));
+        assert!(!pending.exists());
+        assert!(rejected.exists());
+
+        let content = tokio::fs::read_to_string(&rejected).await.unwrap();
+        let rejected_val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            rejected_val["rejection_reason"].as_str().unwrap(),
+            "tests are insufficient"
+        );
+        assert!(rejected_val["rejected_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn promotions_reject_not_found() {
+        let state = test_state_isolated();
+        let promo_dir = state.config.data_dir.join("promotions/pending");
+        tokio::fs::create_dir_all(&promo_dir).await.unwrap();
+
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "taskId": "nonexistent-id",
+            "reason": "bad"
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/reject")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(&ServerConfig::test().jwt_secret),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(val["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn promotions_require_auth() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/promotions/list")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
