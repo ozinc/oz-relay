@@ -14,12 +14,13 @@ Restart=always
 RestartSec=5
 
 EnvironmentFile=/opt/oz-relay/config/config.env
+Environment=HOME=/opt/oz-relay
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/oz-relay/logs /opt/arcflow/.relay-worktrees /opt/promotions /opt/oz-relay/cargo-cache
+ReadWritePaths=/opt/oz-relay /opt/arcflow /opt/promotions
 PrivateTmp=true
 
 # Resource limits
